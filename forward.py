@@ -1,22 +1,18 @@
+import json
+import os
+import shutil
 import subprocess
 import tempfile
-import shutil
-
-import os
 import uuid
-import json
+import sys
 
 import numpy as np
 
-# We need to 
-# 1. Build default HT.jl configs
-# 2. Denormalize (state, control) pairs (or maybe accept them already denormalized?)
-# 3. Turn denormalized (state, control) pairs into HT.jl configs
-# 4. Run the code (in parallel!)
-# 5. Normalize the resulting (new_state, data)
-# 6. Save to files
+#sys.path.append("/home/archermarks/projects/hall_diffusion/python")
 
-# We'll also need to make sure we're using the same normalization and thruster info
+#from utils.thruster_data import ThrusterDataset
+
+from hall_diffusion.utils.thruster_data import ThrusterDataset
 
 def getkey_deep(d, keystr):
     """Return the value of a key of dictionary d multiple levels deep, with each level separated by a period (.)"""
@@ -39,7 +35,7 @@ def setkey_deep(d, keystr, val, new_ok=False):
         raise KeyError(f"Key {keystr} not in dictionary and new_ok is false!")
 
 class ForwardModel:
-    def __init__(self, case_config, num_workers=1, verbose=False):
+    def __init__(self, case_config, controls, dataset_dir, num_workers=1, verbose=False):
         # will need at least
         # 1. a ThrusterDataset (for normalizing and denormalizing as well as querying fields)
         # 2. a thruster information json (like we used for generating data)
@@ -47,6 +43,9 @@ class ForwardModel:
         # 4. Some information about data calculation
         self.num_workers = num_workers
         self.verbose = verbose
+        self.controls = controls
+
+        self.dataset = ThrusterDataset(dataset_dir, scalars_in_tensor=True, fourier_features=True)
 
         with open(case_config, "rb") as fd:
             cfg = json.load(fd)
@@ -112,10 +111,13 @@ class ForwardModel:
         # Generate a valid HallThruster.jl config dictionary corresponding to
         # the passed-in state and control
         cfg = self._base_config()
-        
-        # TODO: temporary, need to actually extract the values from the data tensor
-        for keystr, val in control.items():
-            setkey_deep(cfg, keystr, val)
+
+        # Extract state information (TODO: need to actually get this from tensor)
+        ...
+
+        # Extract controls
+        for keystr, control_val in zip(self.controls, control):
+            setkey_deep(cfg, keystr, control_val)
 
         return cfg
 
@@ -132,9 +134,11 @@ class ForwardModel:
         try:
             input_dir = os.path.join(tmp_dir, "inputs")
             output_dir = os.path.join(tmp_dir, "outputs")
+            output_data_dir = os.path.join(output_dir, "data")
 
             os.makedirs(input_dir, exist_ok=True)
             os.makedirs(output_dir, exist_ok=True)
+            os.makedirs(output_data_dir, exist_ok=True)
 
             # Generate a UUID for each (state, control) pair so we can later find the corresponding outputs
             ids = [uuid.uuid4() for _ in zip(states, controls)]
@@ -157,14 +161,17 @@ class ForwardModel:
                 "--startup=no",
                 "run_forward.jl",
                 input_dir,
-                output_dir,
+                output_data_dir,
             ])
+
+            # Write metadata (including normalization info to output file)
+            self.dataset.write_metadata(output_dir)
 
             # We read the un-normalized output data and calculate the data metric and states from it
             # We then return these as (new_state, y) pairs, or None if there was a failure
             outputs = []
             for id in ids:
-                output_file = os.path.join(output_dir, f"{id}.npz")
+                output_file = os.path.join(output_data_dir, f"{id}.npz")
                 if os.path.exists(output_file):
                     contents = np.load(output_file)
                     # TODO: better to use dataset to load this
@@ -174,6 +181,7 @@ class ForwardModel:
         finally:
             # Clean up the temporary directory
             shutil.rmtree(tmp_dir)
+            #pass
 
         return outputs
 
@@ -184,16 +192,24 @@ if __name__ == "__main__":
     setkey_deep(d, "a.b.c.d", 2)
     print(f"{getkey_deep(d, "a.b.c.d")}")
 
-    model = ForwardModel("thrusters/h9.json", verbose=True, num_workers=8)
+    model = ForwardModel(
+        "thrusters/h9.json",
+        controls = [
+            # "config.anode_mass_flow_rate",
+            # "config.discharge_voltage",
+            "config.magnetic_field_scale",
+        ],
+        dataset_dir = "inputs",
+        verbose=True,
+        num_workers=8,
+    )
 
-    neutral_vels = [100, 150, 200, 250, 300]
-    controls = [
-        {"config.neutral_velocity": v} for v in neutral_vels
-    ]
+    field_scales = [[0.75], [1.0], [1.25]]
+    states = [None, None, None] # TODO
 
-    states = [{} for _ in neutral_vels]
-
-    outputs = model(states, controls, dir="files")
+    outputs = model(states, field_scales, dir="files")
 
     for o in outputs:
         print(o[0])
+
+    #dataset = ThrusterDataset("files/outputs", scalars_in_tensor=True, fourier_features=True)

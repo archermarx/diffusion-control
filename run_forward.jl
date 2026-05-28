@@ -1,5 +1,8 @@
 @show Threads.nthreads()
 
+# TODO: either bundle normalize_data in this repo or expose this as an arg
+# TODO TODO: split julia code from main hall_diffusion repo and make separate package that we can just add
+# Currently, we just find the hall_diffusion repo and reuse its Julia environment.
 diffusion_dir = "/home/archermarks/projects/hall_diffusion"
 using Pkg
 Pkg.activate(diffusion_dir)

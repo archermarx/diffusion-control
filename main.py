@@ -1,42 +1,43 @@
 import numpy as np
 
+from surrogate import Surrogate
+from forward import ForwardModel
+from reverse import ReverseModel
+from thruster_controller import ThrusterController
+
 def _validate_in_range(val, name, lo=float("-inf"), hi=float("inf")):
     if val < lo or val > hi:
         raise ValueError(f"{name} must be between {lo} and {hi}! Got: {val}")
     return val
 
-class Surrogate:
-    def __init__(self, dim=1):
-        self.dim=dim
-
-    def __call__(self, x) -> float:
-        return 0.0
-
-    def update(self, x, y) -> None:
-        pass
-
-    def optimize(self) -> tuple[np.ndarray, float]:
-        return np.zeros(self.dim), 0.0
+#  TODO
+# - Logging of what commands we send, and what data we get back
+# - Could save all reverse + forward samples in some per-iteration folder
+# - Command thruster
+# - Build + update surrogate in 1-3 D
+# - Integrate reverse model
 
 class DiffusionController:
     def __init__(
             self,
-            c0,                     # List of starting control values
-            forward=None,           # Forward model, mapping controls + state -> new state + data.
-            forward_args=None,      # Dict of extra args to pass to forward model fn.
-            surrogate: Surrogate | None = None, # Surrogate model type, TODO: define API.
-            metric=None,            # Function from data -> reals, positive definite.
-            metric_args=None,       # Dict of extra args to pass to metric fn.
-            reverse=None,           # Reverse model, maps data to several (control, state) estimates.
-            num_reverse_samples=1,  # Number of samples to draw from the reverse model fn.
-            forwards_per_reverse=1, # How many forward model samples to draw per reverse sample
-            reverse_args=None,      # Dict of extra args to pass to reverse model.
-            model_trust=1.0,        # Starting model trust parameter (default 1).
-            trust_relaxation=0.5,   # Under-relaxation parameter for updating model trust.
+            c0,                                           # Starting control values. TODO: also pass specification listing what each index is (or pass as dict)
+            controller: ThrusterController,               # Thruster controller
+            forward: ForwardModel| None = None,           # Forward model, mapping controls + state -> new state + data.
+            forward_args=None,                            # Dict of extra args to pass to forward model fn.
+            surrogate: Surrogate | None = None,           # Surrogate model type, TODO: define API.
+            metric=None,                                  # Function from data -> reals, positive definite.
+            metric_args=None,                             # Dict of extra args to pass to metric fn.
+            reverse: ReverseModel | None =None,           # Reverse model, maps data to several (control, state) estimates.
+            num_reverse_samples=1,                        # Number of samples to draw from the reverse model fn.
+            forwards_per_reverse=1,                       # How many forward model samples to draw per reverse sample
+            reverse_args=None,                            # Dict of extra args to pass to reverse model.
+            model_trust=1.0,                              # Starting model trust parameter (default 1).
+            trust_relaxation=0.5,                         # Under-relaxation parameter for updating model trust.
         ):
 
         self.step = 0
         self.step_scale = 1.0
+        self.controller = controller
 
         self.control_point = np.array(c0),
         self.control_dim = len(c0)
@@ -84,10 +85,14 @@ class DiffusionController:
 
         return self.model_trust
 
-    def update(self, c, y):
+    def update(self, c):
+        # Control thruster to the given control point
         self.control_point = c
+        self.controller.control_to(c)
+        y = self.controller.take_data()
 
         # Evaluate metric on data
+        # TODO: apply constraints here?
         z = self.metric(y, **self.metric_args)
 
         # Update model trust
@@ -113,6 +118,7 @@ class DiffusionController:
                 for _ in range(self.forwards_per_reverse):
                     # Proposed control action is a mixture of surrogate direction and random noise
                     # Balances exploration / exploitation
+                    # TODO: Apply constraints here?
                     rand_direction = np.random.standard_normal(self.control_dim)
                     surr_direction = c_surr - ck
                     c_prop = ck + self.step_scale * ((1 - T) * surr_direction + rand_direction)
@@ -155,6 +161,8 @@ class DiffusionController:
         else:
             c_final = (1 - T) * c_surr + T * c_model
 
+        # TODO: apply constraints here?
+
         # Predict surrogate output at this point
         z_surr = self.surrogate(c_final) if self.surrogate else float("inf")
 
@@ -169,7 +177,6 @@ class DiffusionController:
 
         self.z_pred_model = z_model
         self.z_pred_surr = z_surr
-
         self.step += 1
 
         return c_final
