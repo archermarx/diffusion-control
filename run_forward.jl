@@ -17,7 +17,7 @@ as well as the params with which the simulation was run.
 """
 function save_sim(sim, params = nothing)
     avg = if length(sim.frames) > 1
-        het.time_average(sim, length(sim.frames) ÷ 2)
+        het.time_average(sim, sim.t[end] / 2)
     else
         sim
     end
@@ -45,6 +45,10 @@ Threads.@threads for i in eachindex(input_files)
     out_file = joinpath(output_dir, "$(base).npz")
 
     sol = het.run_simulation(in_file)
+    if sol.retcode != :success
+        continue
+    end
+
     params = Dict(
         :anode_mass_flow_rate_kg_s => sol.config.propellants[].flow_rate_kg_s,
         :neutral_velocity_m_s => sol.config.propellants[].velocity_m_s,
@@ -55,13 +59,16 @@ Threads.@threads for i in eachindex(input_files)
     )
 
     sim_dict = save_sim(sol, params)
-    output = load_single_sim(sim_dict)
-    out_dict = Dict(
-        "params" => Float32.(output.params[2]),
-        "data" => Float32.(output.fields[2]),
-        "fourier" => Float32.(output.fourier[2]),
-        "perf" => Float32.(output.performance[2]),
-    )
 
-    NPZ.npzwrite(out_file, out_dict)
+    if !isnothing(sim_dict)
+        output = load_single_sim(sim_dict)
+        out_dict = Dict(
+            "params" => Float32.(output.params[2]),
+            "data" => Float32.(output.fields[2])',
+            "fourier" => Float32.(output.fourier[2]),
+            "perf" => Float32.(output.performance[2]),
+        )
+
+        NPZ.npzwrite(out_file, out_dict)
+    end
 end

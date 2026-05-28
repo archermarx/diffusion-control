@@ -4,15 +4,10 @@ import shutil
 import subprocess
 import tempfile
 import uuid
-import sys
 
 import numpy as np
 
-#sys.path.append("/home/archermarks/projects/hall_diffusion/python")
-
-#from utils.thruster_data import ThrusterDataset
-
-from hall_diffusion.utils.thruster_data import ThrusterDataset
+from hall_diffusion.utils.thruster_data import ThrusterDataset, invert_fft_vec
 
 def getkey_deep(d, keystr):
     """Return the value of a key of dictionary d multiple levels deep, with each level separated by a period (.)"""
@@ -35,18 +30,15 @@ def setkey_deep(d, keystr, val, new_ok=False):
         raise KeyError(f"Key {keystr} not in dictionary and new_ok is false!")
 
 class ForwardModel:
-    def __init__(self, case_config, controls, dataset_dir, num_workers=1, verbose=False):
-        # will need at least
-        # 1. a ThrusterDataset (for normalizing and denormalizing as well as querying fields)
-        # 2. a thruster information json (like we used for generating data)
-        # 3. Some information about how controls are mapped to config keys
-        # 4. Some information about data calculation
-        self.num_workers = num_workers
-        self.verbose = verbose
-        self.controls = controls
-
+    def __init__(self, case_config, controls, dataset_dir, duration = 1e-3, num_workers=1, verbose=False):
+        self.num_workers = num_workers  # How many parallel workers/threads to employ for running simulations
+        self.controls = controls        # Dictionary of control actions
+        self.duration = duration        # How long (in s) to run the forward model
+        self.verbose = verbose          # Whether HT.jl will print info about simulation success/failure
+        # Dataset object, useful for normalizing, denormalizing, and loading data
         self.dataset = ThrusterDataset(dataset_dir, scalars_in_tensor=True, fourier_features=True)
 
+        # Read thruster configuration file to grab geometry, propellant, and wall material
         with open(case_config, "rb") as fd:
             cfg = json.load(fd)
             self.thruster = cfg["thruster"]
@@ -56,12 +48,14 @@ class ForwardModel:
     def _base_config(self):
         L_ch = self.thruster["geometry"]["channel_length"]
         domain = (0.0, 3.2 * L_ch)
-        num_cells = 64
+        num_cells = 128
         edges = np.linspace(domain[0], domain[1], num_cells+1)
         z_cell = 0.5 * (edges[:-1] + edges[1:])
         f_anom_base = 0.0625 * np.ones(num_cells)
         f_anom_base[z_cell < L_ch] = 0.00625
 
+        # All values marked `placeholder` will be replaced from the simulation state
+        # and/or from controls
         config = dict(
             thruster = self.thruster,
             domain = domain,
@@ -80,7 +74,7 @@ class ForwardModel:
             wall_loss_model = dict(
                 type="WallSheath",
                 material = self.wall_material,
-                loss_scale=1.0,                 # placeholder
+                loss_scale=1.0,           # placeholder
             ),
             ion_wall_losses = True,
             filter_circuit = dict(
@@ -91,7 +85,7 @@ class ForwardModel:
         )
         
         simulation = dict(
-            duration=2e-3,
+            duration=self.duration,
             dt=1e-9,
             grid=dict(
                 type="EvenGrid",
@@ -99,6 +93,7 @@ class ForwardModel:
             ),
             verbose=self.verbose,
             print_errors=self.verbose,
+            num_save=2001
         )
 
         return {
@@ -108,12 +103,30 @@ class ForwardModel:
         }
     
     def _make_config(self, state, control):
-        # Generate a valid HallThruster.jl config dictionary corresponding to
-        # the passed-in state and control
+        """Generate a valid HallThruster.jl config dictionary corresponding to the given state and control"""
         cfg = self._base_config()
 
-        # Extract state information (TODO: need to actually get this from tensor)
-        ...
+        # Get anomalous collision frequency from tensor
+        nu_anom = self.dataset.get_field(state, "nu_an", action="denormalize")
+        B = self.dataset.get_field(state, "B", action="denormalize")
+        wce = 1.6e-19 * B / 9.1e-31
+        c_anom = nu_anom / wce
+        c_anom = c_anom.squeeze(0).tolist()
+        setkey_deep(cfg, "config.anom_model.cs", c_anom)
+
+        # Extract 6 scalar params from tensor
+        keymap = {
+            "anode_mass_flow_rate_kg_s": "config.anode_mass_flow_rate",
+            "neutral_velocity_m_s": "config.neutral_velocity",
+            "discharge_voltage_v": "config.discharge_voltage",
+            "wall_loss_scale": "config.wall_loss_model.loss_scale",
+            "cathode_coupling_voltage_v": "config.cathode_coupling_voltage",
+            "magnetic_field_scale": "config.magnetic_field_scale",
+        }
+
+        for (oldkey, newkey) in keymap.items():
+            val = self.dataset.get_field(state, oldkey, action="denormalize")
+            setkey_deep(cfg, newkey, val.mean().item())
 
         # Extract controls
         for keystr, control_val in zip(self.controls, control):
@@ -121,14 +134,16 @@ class ForwardModel:
 
         return cfg
 
-    def __call__(self, states, controls, dir=None):
+    def __call__(self, inputs, dir=None):
         if dir is None:
             # Generate temporary directory to hold configs written by python (tmp_dir/inputs)
             # and outputs from julia (tmp_dir/outputs)
             tmp_dir = tempfile.mkdtemp()
         else:
             tmp_dir = dir
-            os.makedirs(tmp_dir, exist_ok=True)
+            if os.path.exists(tmp_dir):
+                shutil.rmtree(tmp_dir)
+            os.makedirs(tmp_dir)
 
         # Try-finally block helps ensure tmp_dir gets cleaned up
         try:
@@ -141,9 +156,9 @@ class ForwardModel:
             os.makedirs(output_data_dir, exist_ok=True)
 
             # Generate a UUID for each (state, control) pair so we can later find the corresponding outputs
-            ids = [uuid.uuid4() for _ in zip(states, controls)]
+            ids = [uuid.uuid4() for _ in inputs]
 
-            for (id, x, c) in zip(ids, states, controls):
+            for (id, (x, c)) in zip(ids, inputs):
                 # Generate config corresponding to each (state, control) pair and write it to JSON
                 config = self._make_config(x, c)
                 tmp_file = os.path.join(input_dir, f"{id}.json")
@@ -153,7 +168,6 @@ class ForwardModel:
             # Invoke subprocess call to julia function
             # Julia reads input config files from `input_dir` and puts outputs, unnormalized and in .npz format, in output_dir
             # Failures and such (following the same criteria as we use to prune sims in normalize_data) will not be written
-            print(os.getcwd())
             subprocess.run([
                 "julia", 
                 "-t", str(self.num_workers),
@@ -169,28 +183,35 @@ class ForwardModel:
 
             # We read the un-normalized output data and calculate the data metric and states from it
             # We then return these as (new_state, y) pairs, or None if there was a failure
+            output_dict = {}
+            output_dataset = ThrusterDataset(
+                output_dir,
+                scalars_in_tensor=self.dataset.scalars_in_tensor,
+                fourier_features=self.dataset.fourier_features,
+            )
+
+            for file, fourier, state in output_dataset:
+                output_dict[file] = (state, fourier)
+
             outputs = []
             for id in ids:
-                output_file = os.path.join(output_data_dir, f"{id}.npz")
-                if os.path.exists(output_file):
-                    contents = np.load(output_file)
-                    # TODO: better to use dataset to load this
-                    outputs.append((contents["params"], contents["data"], contents["fourier"], contents["perf"]))
+                output_file = f"{id}.npz"
+                if output_file in output_dict:
+                    outputs.append(output_dict[output_file])
                 else:
                     outputs.append(None)
         finally:
             # Clean up the temporary directory
             shutil.rmtree(tmp_dir)
-            #pass
 
         return outputs
 
 if __name__ == "__main__":
     d = dict(a = dict(b = dict(c = dict(d = 10, e = 5))))
-    print(f"{getkey_deep(d, "a.b.c.d")}")
+    assert(getkey_deep(d, "a.b.c.d") == 10)
 
     setkey_deep(d, "a.b.c.d", 2)
-    print(f"{getkey_deep(d, "a.b.c.d")}")
+    assert(getkey_deep(d, "a.b.c.d") == 2)
 
     model = ForwardModel(
         "thrusters/h9.json",
@@ -199,17 +220,28 @@ if __name__ == "__main__":
             # "config.discharge_voltage",
             "config.magnetic_field_scale",
         ],
-        dataset_dir = "inputs",
+        dataset_dir="inputs",
         verbose=True,
         num_workers=8,
+        duration=2e-3,
     )
 
-    field_scales = [[0.75], [1.0], [1.25]]
-    states = [None, None, None] # TODO
+    field_scale = [0.75, 1.0, 1.25]
+    controls = [[f] for f in field_scale]
+    inds = np.random.choice(np.arange(len(model.dataset)), len(field_scale), replace=False)
+    states = [state[None, ...] for _, _, state in [model.dataset[i] for i in inds]]
 
-    outputs = model(states, field_scales, dir="files")
+    state_control_pairs = list(zip(states, controls))
+    outputs = model(state_control_pairs, dir="files")
 
     for o in outputs:
-        print(o[0])
+        state, fourier = o
+        bfield_scale = model.dataset.get_field(state[None, ...], "magnetic_field_scale").mean().item()
 
-    #dataset = ThrusterDataset("files/outputs", scalars_in_tensor=True, fourier_features=True)
+        t = np.linspace(0, model.duration / 2, 1001)
+        signal = invert_fft_vec(t, fourier)
+        print(f"{np.mean(signal)=}")
+
+        import matplotlib.pyplot as plt
+        plt.plot(t, signal)
+        plt.savefig("signal.png")

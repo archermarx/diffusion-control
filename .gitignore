@@ -12,3 +12,4 @@ wheels/
 # Project-specific files
 thrusters
 inputs
+*.png

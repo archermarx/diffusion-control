@@ -5,6 +5,10 @@ from forward import ForwardModel
 from reverse import ReverseModel
 from thruster_controller import ThrusterController
 
+from concurrent.futures import ThreadPoolExecutor
+
+INF = float("inf")
+
 def _validate_in_range(val, name, lo=float("-inf"), hi=float("inf")):
     if val < lo or val > hi:
         raise ValueError(f"{name} must be between {lo} and {hi}! Got: {val}")
@@ -16,6 +20,18 @@ def _validate_in_range(val, name, lo=float("-inf"), hi=float("inf")):
 # - Command thruster
 # - Build + update surrogate in 1-3 D
 # - Integrate reverse model
+# - Integrate constraints (ideally smooth, differentiable)
+
+def log_penalty(x, lb, ub, penalty_strength = 5e-2):
+    """Evaluate a smoothly differentiable constraint penalty function that is ~zero far from the constraints and ~inf close to them"""
+    # Using logarithmic barrier function: https://en.wikipedia.org/wiki/Barrier_function
+    # We should save the actual predicted metric separately from the combined objective function 
+    # Here's a desmos link demonstrating the functions in 1D: https://www.desmos.com/calculator/wjk4t1m2z5
+    midpoint = 0.5 * (lb + ub)
+    midpoint_f = -np.log(midpoint-lb) - np.log(ub - midpoint)
+    penalty_per_dim = -np.log(x-lb) - np.log(ub-x) - midpoint_f
+    total_penalty = penalty_strength * np.mean(penalty_per_dim)
+    return total_penalty
 
 class DiffusionController:
     def __init__(
@@ -23,45 +39,75 @@ class DiffusionController:
             c0,                                           # Starting control values. TODO: also pass specification listing what each index is (or pass as dict)
             controller: ThrusterController,               # Thruster controller
             forward: ForwardModel| None = None,           # Forward model, mapping controls + state -> new state + data.
-            forward_args=None,                            # Dict of extra args to pass to forward model fn.
             surrogate: Surrogate | None = None,           # Surrogate model type, TODO: define API.
             metric=None,                                  # Function from data -> reals, positive definite.
-            metric_args=None,                             # Dict of extra args to pass to metric fn.
             reverse: ReverseModel | None =None,           # Reverse model, maps data to several (control, state) estimates.
             num_reverse_samples=1,                        # Number of samples to draw from the reverse model fn.
             forwards_per_reverse=1,                       # How many forward model samples to draw per reverse sample
-            reverse_args=None,                            # Dict of extra args to pass to reverse model.
             model_trust=1.0,                              # Starting model trust parameter (default 1).
             trust_relaxation=0.5,                         # Under-relaxation parameter for updating model trust.
+            control_lb = None,                            # Lower bounds for all control variables
+            control_ub = None,                            # Upper bounds for all control variables
+            penalty_strength = 5e-2,                      # The scale factor of the logarithmic penalty function used to avoid the bounds
         ):
 
         self.step = 0
-        self.step_scale = 1.0
-        self.controller = controller
 
+        # TODO: decide on a way to decrement step_scale over time
+        self.step_scale = 1.0
         self.control_point = np.array(c0),
         self.control_dim = len(c0)
-        self.model_trust = _validate_in_range(model_trust, "Model trust", 0, 1)
-        self.trust_relaxation = _validate_in_range(trust_relaxation, "Trust relaxation", 0, 1)
 
+        # Check length and contents of bounds
+        self.penalty_strength = penalty_strength
+        self.control_lb = control_lb if control_lb else [-INF for _ in range(self.control_dim)]
+        self.control_lb = control_lb if control_lb else [INF for _ in range(self.control_dim)]
+        assert len(control_lb) == self.control_dim, f"Control lower bound must have length {self.control_dim} to match control dimension, but got {len(control_lb)}"
+        assert len(control_ub) == self.control_dim, f"Control upper bound must have length {self.control_dim} to match control dimension, but got {len(control_lb)}"
+        assert np.all(self.control_ub >= self.control_lb), f"Control upper bound must be >= lower bound for all variables. Got lb: {control_lb} and ub: {control_ub}."
+
+        # Set up the three main components of the controller/optimizer
+        self.controller = controller
         self.forward = forward
         self.reverse = reverse
         self.surrogate = surrogate
 
-        # Previous model and surrogate predicted metrics, used to update model trust
-        self.z_pred_surr = None
-        self.z_pred_model = None
-
+        # Check metric
         if metric is None:
             raise ValueError("Metric must be specified! This should be a function of the data which returns a positive number.")
-        self.metric = metric
 
-        self.forward_args = forward_args if forward_args else {} 
-        self.reverse_args = reverse_args if reverse_args else {}
-        self.metric_args = metric_args if metric_args else {}
+        # TODO: integrate constraints into auxilliary metric function
+        # something like the following, making sure to return both values (z and z')
+        # this is important because we should use z' for picking control points but z for evaluating
+        # how well we predicted things for model trust checking
+        # Would need to also update calls to self.metric to pass in the corresponding control point
+        # -----------------------------------
+        # def metric_with_constraint(c, y):
+        #     z = metric(y)
+        #     z_prime = log_penalty(c, self.control_lb, self.control_ub, self.constraint_strength)
+        #     return z, z_prime
+        #
+        # self.metric = metric_with_constraint
+        # -----------------------------------
+        self.metric = metric
 
         self.num_reverse_samples = _validate_in_range(num_reverse_samples, "Num reverse samples", lo=1)
         self.forwards_per_reverse = _validate_in_range(forwards_per_reverse, "Forwards per reverse", lo=1)
+
+        # Asynchronous executor, used to spin off forward model calls
+        self.executor = ThreadPoolExecutor(max_workers=1)
+
+        # Previous model and surrogate predicted metrics, used to update model trust
+        self.z_pred_surr = None
+        self.z_pred_model = None
+        self.z_pred_model_future = None
+
+        self.model_trust = _validate_in_range(model_trust, "Model trust", 0, 1)
+        self.trust_relaxation = _validate_in_range(trust_relaxation, "Trust relaxation", 0, 1)
+
+    def __del__(self):
+        # Destructor shuts down the ThreadPoolExecutor
+        self.executor.shutdown(wait=True)
 
     def update_model_trust(self, z):
         if self.z_pred_model is None or self.z_pred_surr is None:
@@ -92,10 +138,22 @@ class DiffusionController:
         y = self.controller.take_data()
 
         # Evaluate metric on data
-        # TODO: apply constraints here?
         z = self.metric(y, **self.metric_args)
 
-        # Update model trust
+        # Await results of forward model from before and average the metrics
+        if self.z_pred_model_future is not None:
+            z_pred_model_results = self.z_pred_model_future.result()
+            self.z_pred_model = 0.0
+            count = 0
+            for result in z_pred_model_results:
+                if result is None:
+                    continue
+                _, yk = result
+                self.z_pred_model += self.metric(yk)
+                count += 1
+            self.z_pred_model /= count
+
+        # Update model trust using previous model predictions
         T = self.update_model_trust(z)
 
         if self.surrogate is not None:
@@ -125,11 +183,11 @@ class DiffusionController:
                     proposed_controls.append([xk, c_prop])
 
             # Evaluate forward model for each state estimate / control action pair
-            # TODO: set up joblib/multiprocessing infrastructure to do this in parallel
-            forward_samples = []
-            for (xk, ck) in proposed_controls:
-                (xk_new, yk) = self.forward(xk, ck, **self.forward_args)
-                forward_samples.append([xk_new, yk])
+            # We do this asynchronously but immediately await the result
+            # The async part is thus not really necessary, but I am leaving it in in case we 
+            # might want to interleave additional work in the future.
+            future = self.executor.submit(self.forward, proposed_controls)
+            forward_samples = future.result()
 
             # Eval metrics and weight control proposals based on metrics
             # This could be in the previous loop if serial, but
@@ -137,6 +195,9 @@ class DiffusionController:
             numerator = np.zeros(self.control_dim)
             denominator = 0.0
             for forward_sample, control_prop in zip(forward_samples, proposed_controls):
+                if forward_sample is None:
+                    # This occurs for simulation failures and other invalid states
+                    continue
                 (_, ck) = control_prop
                 (xk_new, yk) = forward_sample
                 zk = self.metric(yk, **self.metric_args)
@@ -161,22 +222,14 @@ class DiffusionController:
         else:
             c_final = (1 - T) * c_surr + T * c_model
 
-        # TODO: apply constraints here?
-
         # Predict surrogate output at this point
-        z_surr = self.surrogate(c_final) if self.surrogate else float("inf")
+        self.z_pred_surr = self.surrogate(c_final) if self.surrogate else float("inf")
 
-        # TODO: write async code to do this (using asyncio probably)
-        # NOTE: should write helper function to spawn a bunch of forward model evaluations asynchronously
-        z_model = 0.0
-        if self.forward is not None:
-            for xk, _ in proposed_controls:
-                _, y_final = self.forward(xk, c_final, **self.forward_args)
-                z_model += self.metric(y_final, **self.metric_args)
-            z_model /= len(proposed_controls)
+        # Predict mean model output asynchronously (so we can simultaneously command the thruster)
+        final_controls = [(xk, c_final) for xk, _ in reverse_samples]
+        self.z_pred_model_future = self.executor.submit(self.forward, final_controls)
 
-        self.z_pred_model = z_model
-        self.z_pred_surr = z_surr
         self.step += 1
 
+        # Return final proposed control action
         return c_final
