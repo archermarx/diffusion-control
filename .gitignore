@@ -13,3 +13,5 @@ wheels/
 thrusters
 inputs
 *.png
+reverse_model
+reverse_samples

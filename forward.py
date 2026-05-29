@@ -7,7 +7,7 @@ import uuid
 
 import numpy as np
 
-from hall_diffusion.utils.thruster_data import ThrusterDataset, invert_fft_vec
+from hall_diffusion.utils.thruster_data import ThrusterDataset, invert_fft_vector
 
 def getkey_deep(d, keystr):
     """Return the value of a key of dictionary d multiple levels deep, with each level separated by a period (.)"""
@@ -31,10 +31,22 @@ def setkey_deep(d, keystr, val, new_ok=False):
 
 class ForwardModel:
     def __init__(self, case_config, controls, dataset_dir, duration = 1e-3, num_workers=1, verbose=False):
+        
+        # Maps our diffusion model / control keys to specific entries in the HT.jl config dict
+        self.keymap = {
+            "anode_mass_flow_rate_kg_s": "config.anode_mass_flow_rate",
+            "neutral_velocity_m_s": "config.neutral_velocity",
+            "discharge_voltage_v": "config.discharge_voltage",
+            "wall_loss_scale": "config.wall_loss_model.loss_scale",
+            "cathode_coupling_voltage_v": "config.cathode_coupling_voltage",
+            "magnetic_field_scale": "config.magnetic_field_scale",
+        }
+
         self.num_workers = num_workers  # How many parallel workers/threads to employ for running simulations
         self.controls = controls        # Dictionary of control actions
         self.duration = duration        # How long (in s) to run the forward model
         self.verbose = verbose          # Whether HT.jl will print info about simulation success/failure
+
         # Dataset object, useful for normalizing, denormalizing, and loading data
         self.dataset = ThrusterDataset(dataset_dir, scalars_in_tensor=True, fourier_features=True)
 
@@ -115,22 +127,13 @@ class ForwardModel:
         setkey_deep(cfg, "config.anom_model.cs", c_anom)
 
         # Extract 6 scalar params from tensor
-        keymap = {
-            "anode_mass_flow_rate_kg_s": "config.anode_mass_flow_rate",
-            "neutral_velocity_m_s": "config.neutral_velocity",
-            "discharge_voltage_v": "config.discharge_voltage",
-            "wall_loss_scale": "config.wall_loss_model.loss_scale",
-            "cathode_coupling_voltage_v": "config.cathode_coupling_voltage",
-            "magnetic_field_scale": "config.magnetic_field_scale",
-        }
-
-        for (oldkey, newkey) in keymap.items():
+        for (oldkey, newkey) in self.keymap.items():
             val = self.dataset.get_field(state, oldkey, action="denormalize")
             setkey_deep(cfg, newkey, val.mean().item())
 
         # Extract controls
         for keystr, control_val in zip(self.controls, control):
-            setkey_deep(cfg, keystr, control_val)
+            setkey_deep(cfg, self.keymap[keystr], control_val)
 
         return cfg
 
@@ -216,9 +219,9 @@ if __name__ == "__main__":
     model = ForwardModel(
         "thrusters/h9.json",
         controls = [
-            # "config.anode_mass_flow_rate",
-            # "config.discharge_voltage",
-            "config.magnetic_field_scale",
+            #"anode_mass_flow_rate_kg_s",
+            #"discharge_voltage_v",
+            "magnetic_field_scale",
         ],
         dataset_dir="inputs",
         verbose=True,
@@ -239,7 +242,7 @@ if __name__ == "__main__":
         bfield_scale = model.dataset.get_field(state[None, ...], "magnetic_field_scale").mean().item()
 
         t = np.linspace(0, model.duration / 2, 1001)
-        signal = invert_fft_vec(t, fourier)
+        signal = invert_fft_vector(t, fourier)
         print(f"{np.mean(signal)=}")
 
         import matplotlib.pyplot as plt
