@@ -17,4 +17,4 @@ dependencies = [
 allow-direct-references = true
 
 [tool.uv.sources]
-hall-diffusion = { path = "../hall_diffusion" }
+hall-diffusion = { path = "../hall_diffusion", editable = true }

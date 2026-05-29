@@ -4,6 +4,7 @@ import shutil
 import subprocess
 import tempfile
 import uuid
+from pathlib import Path
 
 import numpy as np
 
@@ -30,7 +31,14 @@ def setkey_deep(d, keystr, val, new_ok=False):
         raise KeyError(f"Key {keystr} not in dictionary and new_ok is false!")
 
 class ForwardModel:
-    def __init__(self, case_config, controls, dataset_dir, duration = 1e-3, num_workers=1, verbose=False):
+    def __init__(self,
+            case_config: str | Path,
+            controls: list[str],
+            dataset_dir: str | Path,
+            duration: float = 1e-3,
+            num_workers: int =1,
+            verbose: bool = False
+        ):
         
         # Maps our diffusion model / control keys to specific entries in the HT.jl config dict
         self.keymap = {
@@ -43,7 +51,7 @@ class ForwardModel:
         }
 
         self.num_workers = num_workers  # How many parallel workers/threads to employ for running simulations
-        self.controls = controls        # Dictionary of control actions
+        self.controls = controls        # vector of control actions
         self.duration = duration        # How long (in s) to run the forward model
         self.verbose = verbose          # Whether HT.jl will print info about simulation success/failure
 

@@ -166,7 +166,7 @@ dependencies = [
 
 [package.metadata]
 requires-dist = [
-    { name = "hall-diffusion", directory = "../hall_diffusion" },
+    { name = "hall-diffusion", editable = "../hall_diffusion" },
     { name = "matplotlib", specifier = ">=3.10.9" },
     { name = "numpy", specifier = ">=2.4.6" },
     { name = "pandas", specifier = ">=3.0.3" },
@@ -228,7 +228,7 @@ wheels = [
 [[package]]
 name = "hall-diffusion"
 version = "0.1.0"
-source = { directory = "../hall_diffusion" }
+source = { editable = "../hall_diffusion" }
 dependencies = [
     { name = "htucker" },
     { name = "joblib" },
