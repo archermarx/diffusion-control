@@ -3,6 +3,9 @@ import time
 import threading
 from smt.surrogate_models import KRG
 
+
+# TODO: Add in some way to do constraint handeling for controls that would violate physical constraints?
+
 class Surrogate:
     def __init__(self, dim=1):
         self.dim=dim
@@ -36,24 +39,49 @@ class Surrogate:
         return float(y[0, 0])  # TODO: Make sure you're just returning the metric (discharge current pk-pk) because the caller already has the control
 
     # Takes: the input [C, Z] and the output [C_next, Z_next] for training the surrogate
-    def update(self, x, y) -> None:
-        with self.lock:  # ensure thread safety when accessing surrogate model
-            if self.is_training:
-                # If surrogate is currently being trained, return a default control (e.g. zeros)
-                return 0.0
-            else:
-                # Otherwise, predict the next state using the surrogate model
-                y_pred = self.active_model.predict_values(x)
-                # Here you would implement your optimization logic to find the best control based on y_pred
-                # For simplicity, we will just return a placeholder control value
+    def update(self, current_x, actual_y) -> None:
+        """FAST THREAD: Non-blocking call to append data and kick off training."""
 
+        with self.lock:  # ensure thread safety when accessing surrogate model
+            self.X_data.append(current_x)
+            self.Y_data.append(actual_y)
+        
+        # If already training, skip starting another training thread
+        if not self.is_training:
+            self.is_training = True
+            # Spawn another thread
+            training_thread = threading.Thread(target=self._train_surrogate)
+            training_thread.start()
+    
+    def _train_surrogate(self) -> None:
+        """SLOW THREAD: Runs in the background to build the new model."""
+        try:
+            with self.lock: # should have lock to access global data, but we don't want to hold it for the whole training process
+                X_train_shadow = np.array(self.X_data)
+                Y_train_shadow = np.array(self.Y_data)
+
+            # Build model
+            new_model = KRG(theta0=[1e-2] * self.dim, print_global=False)
+            new_model.set_training_values(X_train_shadow, Y_train_shadow)
+            new_model.train()
+
+            # Update the pointer? does python even have poitner??
+            with self.lock:
+                self.active_model = new_model  # update surrogate model to the newly trained model
+
+        finally:            
+            self.is_training = False  # reset training flag when done
+    
     # Might not need
     # Should find the best fit Gaussian Process for the data and return the optimal control
     # Incorporates physical constraints (e.g. max voltage, max mass flow rate)
-    def optimize(self) -> tuple[np.ndarray, float]:
-        return np.zeros(self.dim), 0.0
+    # def optimize(self) -> tuple[np.ndarray, float]:
+    #     return np.zeros(self.dim), 0.0
 
 
 if __name__ == "__main__":
     # Test out basic surrogate construction functionality
-    pass
+    # 4 inputs: [V_d, mass_flow, B_field, current_state (discharge current pk-pk)]
+    surrogate = Surrogate(dim=4)
+    surrogate.update([1.0, 2.0, 3.0, 4.0], [5.0])
+    surrogate.update([2.0, 3.0, 4.0, 5.0], [6.0])
