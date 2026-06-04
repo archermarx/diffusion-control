@@ -15,3 +15,4 @@ inputs
 *.png
 reverse_model
 reverse_samples
+output.json
