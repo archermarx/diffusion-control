@@ -126,18 +126,19 @@ class ForwardModel:
         """Generate a valid HallThruster.jl config dictionary corresponding to the given state and control"""
         cfg = self._base_config()
 
-        # Get anomalous collision frequency from tensor
-        nu_anom = self.dataset.get_field(state, "nu_an", action="denormalize")
-        B = self.dataset.get_field(state, "B", action="denormalize")
-        wce = 1.6e-19 * B / 9.1e-31
-        c_anom = nu_anom / wce
-        c_anom = c_anom.squeeze(0).tolist()
-        setkey_deep(cfg, "config.anom_model.cs", c_anom)
+        if state is not None:
+            # Get anomalous collision frequency from tensor
+            nu_anom = self.dataset.get_field(state, "nu_an", action="denormalize")
+            B = self.dataset.get_field(state, "B", action="denormalize")
+            wce = 1.6e-19 * B / 9.1e-31
+            c_anom = nu_anom / wce
+            c_anom = c_anom.squeeze(0).tolist()
+            setkey_deep(cfg, "config.anom_model.cs", c_anom)
 
-        # Extract 6 scalar params from tensor
-        for (oldkey, newkey) in self.keymap.items():
-            val = self.dataset.get_field(state, oldkey, action="denormalize")
-            setkey_deep(cfg, newkey, val.mean().item())
+            # Extract 6 scalar params from tensor
+            for (oldkey, newkey) in self.keymap.items():
+                val = self.dataset.get_field(state, oldkey, action="denormalize")
+                setkey_deep(cfg, newkey, val.mean().item())
 
         # Extract controls
         for keystr, control_val in zip(self.controls, control):
@@ -145,16 +146,16 @@ class ForwardModel:
 
         return cfg
 
-    def __call__(self, inputs, dir=None):
+    def __call__(self, inputs, dir=None, delete_dir=True, output_files=None):
         if dir is None:
             # Generate temporary directory to hold configs written by python (tmp_dir/inputs)
             # and outputs from julia (tmp_dir/outputs)
             tmp_dir = tempfile.mkdtemp()
         else:
             tmp_dir = dir
-            if os.path.exists(tmp_dir):
+            if os.path.exists(tmp_dir) and delete_dir:
                 shutil.rmtree(tmp_dir)
-            os.makedirs(tmp_dir)
+            os.makedirs(tmp_dir, exist_ok=True)
 
         # Try-finally block helps ensure tmp_dir gets cleaned up
         try:
@@ -167,7 +168,11 @@ class ForwardModel:
             os.makedirs(output_data_dir, exist_ok=True)
 
             # Generate a UUID for each (state, control) pair so we can later find the corresponding outputs
-            ids = [uuid.uuid4() for _ in inputs]
+            if output_files is None:
+                ids = [uuid.uuid4() for _ in inputs]
+            else:
+                assert len(inputs) == len(output_files)
+                ids = output_files
 
             for (id, (x, c)) in zip(ids, inputs):
                 # Generate config corresponding to each (state, control) pair and write it to JSON
