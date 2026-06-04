@@ -65,7 +65,7 @@ class ForwardModel:
             self.wall_material = cfg["wall_material"]
             self.propellant = cfg["propellant"]
 
-    def _base_config(self):
+    def _base_config(self, output_file=None):
         L_ch = self.thruster["geometry"]["channel_length"]
         domain = (0.0, 3.2 * L_ch)
         num_cells = 128
@@ -122,7 +122,7 @@ class ForwardModel:
             "postprocess": {},
         }
     
-    def _make_config(self, state, control):
+    def _make_config(self, state, control, output_file=None):
         """Generate a valid HallThruster.jl config dictionary corresponding to the given state and control"""
         cfg = self._base_config()
 
@@ -143,6 +143,10 @@ class ForwardModel:
         # Extract controls
         for keystr, control_val in zip(self.controls, control):
             setkey_deep(cfg, self.keymap[keystr], control_val)
+
+        # Set output file
+        if output_file is not None:
+            cfg["postprocess"]["output_file"] = output_file
 
         return cfg
 
@@ -168,15 +172,13 @@ class ForwardModel:
             os.makedirs(output_data_dir, exist_ok=True)
 
             # Generate a UUID for each (state, control) pair so we can later find the corresponding outputs
-            if output_files is None:
-                ids = [uuid.uuid4() for _ in inputs]
-            else:
-                assert len(inputs) == len(output_files)
-                ids = output_files
+            ids = [uuid.uuid4() for _ in inputs]
 
-            for (id, (x, c)) in zip(ids, inputs):
+            for (i, (id, (x, c))) in enumerate(zip(ids, inputs)):
                 # Generate config corresponding to each (state, control) pair and write it to JSON
-                config = self._make_config(x, c)
+                output_file = output_files[i] if output_files else None
+                config = self._make_config(x, c, output_files[i])
+
                 tmp_file = os.path.join(input_dir, f"{id}.json")
                 with open(tmp_file, "w") as fd:
                     json.dump(config, fd)
@@ -218,7 +220,8 @@ class ForwardModel:
                     outputs.append(None)
         finally:
             # Clean up the temporary directory
-            shutil.rmtree(tmp_dir)
+            if delete_dir:
+                shutil.rmtree(tmp_dir)
 
         return outputs
 
