@@ -149,31 +149,30 @@ class DiffusionController:
         self.cs.append([c[k] for k in self.control_vars])
         self.zs.append(z)
 
-        # # Await results of forward model from before and average the metrics
-        # if self.z_pred_model_future is not None:
-        #     z_pred_model_results = self.z_pred_model_future.result()
-        #     self.z_pred_model = 0.0
-        #     count = 0
-        #     for result in z_pred_model_results:
-        #         if result is None:
-        #             continue
-        #         _, yk = result
-        #         self.z_pred_model += self.metric(yk)
-        #         count += 1
-        #     self.z_pred_model /= count
+        # Await results of forward model from before and average the metrics
+        if self.z_pred_model_future is not None:
+            z_pred_model_results = self.z_pred_model_future.result()
+            self.z_pred_model = 0.0
+            count = 0
+            for result in z_pred_model_results:
+                if result is None:
+                    continue
+                _, yk = result
+                self.z_pred_model += self.metric(yk)
+                count += 1
+            self.z_pred_model /= count
 
-        # # Update model trust using previous model predictions
-        # T = self.update_model_trust(z)
+            T = self.update_model_trust(z)
 
-        # if self.surrogate is not None:
-        #     # Update surrogate model with new data point
-        #     self.surrogate.update(c, z)
+        if self.surrogate is not None:
+            # Update surrogate model with new data point
+            self.surrogate.update(c, z)
 
-        #     # Perform local optimization on surrogate
-        #     # to find optimal control location
-        #     c_surr, _ = self.surrogate.optimize()
-        # else:
-        #     c_surr, _ = np.zeros(self.control_dim), float("inf")
+            # Perform local optimization on surrogate
+            # to find optimal control location
+            c_surr, _ = self.surrogate.optimize()
+        else:
+            c_surr, _ = np.zeros(self.control_dim), float("inf")
 
         # if self.reverse is not None and self.forward is not None:
         #     # Get state and control estimates
@@ -209,7 +208,7 @@ class DiffusionController:
         #             continue
         #         (_, ck) = control_prop
         #         (xk_new, yk) = forward_sample
-        #         zk = self.metric(yk, **self.metric_args)
+        #         zk = self.metric(yk)
         #         forward_sample.append(zk)
 
         #         numerator += control_prop / zk**2
@@ -238,7 +237,7 @@ class DiffusionController:
         # final_controls = [(xk, c_final) for xk, _ in reverse_samples]
         # self.z_pred_model_future = self.executor.submit(self.forward, final_controls)
 
-        # self.step += 1
+        self.iter += 1
 
         # # Return final proposed control action
-        # return c_final
+        # self.control_point = c_final
