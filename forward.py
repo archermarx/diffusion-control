@@ -36,7 +36,8 @@ class ForwardModel:
             controls: list[str],
             dataset_dir: str | Path,
             duration: float = 1e-3,
-            num_workers: int =1,
+            num_cells: int = 128,
+            num_workers: int = 1,
             verbose: bool = False
         ):
         
@@ -53,6 +54,7 @@ class ForwardModel:
         self.num_workers = num_workers  # How many parallel workers/threads to employ for running simulations
         self.controls = controls        # vector of control actions
         self.duration = duration        # How long (in s) to run the forward model
+        self.num_cells = num_cells      # The number of computational cells to be used in forward simulations
         self.verbose = verbose          # Whether HT.jl will print info about simulation success/failure
 
         # Dataset object, useful for normalizing, denormalizing, and loading data
@@ -65,10 +67,10 @@ class ForwardModel:
             self.wall_material = cfg["wall_material"]
             self.propellant = cfg["propellant"]
 
-    def _base_config(self, output_file=None):
+    def _base_config(self):
         L_ch = self.thruster["geometry"]["channel_length"]
         domain = (0.0, 3.2 * L_ch)
-        num_cells = 128
+        num_cells = self.num_cells
         edges = np.linspace(domain[0], domain[1], num_cells+1)
         z_cell = 0.5 * (edges[:-1] + edges[1:])
         f_anom_base = 0.0625 * np.ones(num_cells)
@@ -177,7 +179,7 @@ class ForwardModel:
             for (i, (id, (x, c))) in enumerate(zip(ids, inputs)):
                 # Generate config corresponding to each (state, control) pair and write it to JSON
                 output_file = output_files[i] if output_files else None
-                config = self._make_config(x, c, output_files[i])
+                config = self._make_config(x, c, output_file)
 
                 tmp_file = os.path.join(input_dir, f"{id}.json")
                 with open(tmp_file, "w") as fd:

@@ -16,3 +16,5 @@ inputs
 reverse_model
 reverse_samples
 output.json
+*.json
+*.npz

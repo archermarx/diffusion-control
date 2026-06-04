@@ -38,9 +38,11 @@ class ThrusterController(ABC):
         pass
 
 class SimulationController(ThrusterController):
-    def __init__(self, dir, data_file):
+    def __init__(self, thruster_config, dataset_dir, dir, data_file):
         self.dir = dir
         self.output_file = data_file
+        self.thruster_config = thruster_config
+        self.dataset_dir = dataset_dir
         self.model = None
         self.setpoint = None
     
@@ -48,9 +50,9 @@ class SimulationController(ThrusterController):
         control_keys = list(c.keys())
         self.setpoint = list(c.values())
         self.model = ForwardModel(
-            "thrusters/h9.json",
+            self.thruster_config,
             controls = control_keys,
-            dataset_dir="inputs",
+            dataset_dir = self.dataset_dir,
             verbose=True,
             num_workers=1,
             duration=2e-3,
