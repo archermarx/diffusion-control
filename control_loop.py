@@ -17,10 +17,8 @@ def _validate_in_range(val, name, lo=float("-inf"), hi=float("inf")):
 #  TODO
 # - Logging of what commands we send, and what data we get back
 # - Could save all reverse + forward samples in some per-iteration folder
-# - Command thruster
 # - Build + update surrogate in 1-3 D
-# - Integrate reverse model
-# - Integrate constraints (ideally smooth, differentiable)
+# - conditioning on normalized discharge current vector
 
 def log_penalty(x, lb, ub, penalty_strength = 5e-2):
     """Evaluate a smoothly differentiable constraint penalty function that is ~zero far from the constraints and ~inf close to them"""
@@ -37,16 +35,18 @@ def log_penalty(x, lb, ub, penalty_strength = 5e-2):
     return total_penalty
 
 class DiffusionController:
+    # TODO: Logging and restarting
+    # TODO: should just need to save previous control values, data, and metrics
+    # TODO: random seed control
     def __init__(
             self,
             c0,                                           # Starting control values. TODO: also pass specification listing what each index is (or pass as dict)
-            control_vars,                                 # Which controls are active (string)
+            control_vars: list[str],                      # Which controls are active (strings)
             controller: ThrusterController,               # Thruster controller
             forward: ForwardModel| None = None,           # Forward model, mapping controls + state -> new state + data.
             surrogate: Surrogate | None = None,           # Surrogate model type, TODO: define API.
             metric=None,                                  # Function from data -> reals, positive definite.
             reverse: ReverseModel | None =None,           # Reverse model, maps data to several (control, state) estimates.
-            num_reverse_samples=1,                        # Number of samples to draw from the reverse model fn.
             forwards_per_reverse=1,                       # How many forward model samples to draw per reverse sample
             model_trust=1.0,                              # Starting model trust parameter (default 1).
             trust_relaxation=0.5,                         # Under-relaxation parameter for updating model trust.
