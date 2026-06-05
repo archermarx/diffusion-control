@@ -29,8 +29,11 @@ def log_penalty(x, lb, ub, penalty_strength = 5e-2):
     # Here's a desmos link demonstrating the functions in 1D: https://www.desmos.com/calculator/wjk4t1m2z5
     midpoint = 0.5 * (lb + ub)
     midpoint_f = -np.log(midpoint-lb) - np.log(ub - midpoint)
+    eps = 1e-6
+    x = np.maximum(lb*(1+eps), np.minimum(ub*(1-eps), x))
     penalty_per_dim = -np.log(x-lb) - np.log(ub-x) - midpoint_f
     total_penalty = penalty_strength * np.mean(penalty_per_dim)
+    print(f"{x[0]=}, {total_penalty=}")
     return total_penalty
 
 class DiffusionController:
@@ -55,7 +58,6 @@ class DiffusionController:
         self.iter = 0
 
         # TODO: decide on a way to decrement step_scale over time
-        self.step_scale = 1.0
         self.control_point = c0
 
         # Running list of control points and metrics
@@ -73,6 +75,10 @@ class DiffusionController:
         assert len(control_ub) == self.control_dim, f"Control upper bound must have length {self.control_dim} to match control dimension, but got {len(control_lb)}"
         assert np.all(self.control_ub >= self.control_lb), f"Control upper bound must be >= lower bound for all variables. Got lb: {control_lb} and ub: {control_ub}."
 
+        self.control_lb = np.array(self.control_lb)
+        self.control_ub = np.array(self.control_ub)
+        self.step_scale = (self.control_ub - self.control_lb) / 4.0
+
         # Set up the three main components of the controller/optimizer
         self.controller = controller
         self.forward = forward
@@ -83,22 +89,12 @@ class DiffusionController:
         if metric is None:
             raise ValueError("Metric must be specified! This should be a function of the data which returns a positive number.")
 
-        # TODO: integrate constraints into auxilliary metric function
-        # something like the following, making sure to return both values (z and z')
-        # this is important because we should use z' for picking control points but z for evaluating
-        # how well we predicted things for model trust checking
-        # Would need to also update calls to self.metric to pass in the corresponding control point
-        # -----------------------------------
-        # def metric_with_constraint(c, y):
-        #     z = metric(y)
-        #     z_prime = log_penalty(c, self.control_lb, self.control_ub, self.constraint_strength)
-        #     return z, z_prime
-        #
-        # self.metric = metric_with_constraint
-        # -----------------------------------
-        self.metric = metric
+        def metric_with_constraint(c, y):
+            z = metric(y)
+            z_prime = z + log_penalty(c, self.control_lb, self.control_ub, self.penalty_strength)
+            return z, z_prime
+        self.metric = metric_with_constraint
 
-        self.num_reverse_samples = _validate_in_range(num_reverse_samples, "Num reverse samples", lo=1)
         self.forwards_per_reverse = _validate_in_range(forwards_per_reverse, "Forwards per reverse", lo=1)
 
         # Asynchronous executor, used to spin off forward model calls
@@ -145,8 +141,9 @@ class DiffusionController:
         y = self.controller.take_data()
 
         # Evaluate metric on data
-        z = self.metric(y)
-        self.cs.append([c[k] for k in self.control_vars])
+        control_vec = [c[k] for k in self.control_vars]
+        z, _ = self.metric(control_vec, y)
+        self.cs.append(control_vec)
         self.zs.append(z)
 
         # Await results of forward model from before and average the metrics
@@ -162,7 +159,7 @@ class DiffusionController:
                 count += 1
             self.z_pred_model /= count
 
-            T = self.update_model_trust(z)
+        T = self.update_model_trust(z)
 
         if self.surrogate is not None:
             # Update surrogate model with new data point
@@ -174,70 +171,86 @@ class DiffusionController:
         else:
             c_surr, _ = np.zeros(self.control_dim), float("inf")
 
-        # if self.reverse is not None and self.forward is not None:
-        #     # Get state and control estimates
-        #     reverse_samples = self.reverse(y, c, n=self.num_reverse_samples, **self.reverse_args)
+        if self.reverse is not None and self.forward is not None:
+            # Get state and control estimates
+            condition_input = c | y
+            # TODO: Condition diffusion model on discharge current
+            # TODO: 1. normalize fourier signal
+            # TODO: 2. pass as conditioning vector
+            # TODO: should we use the current point or the best point to initialize this?
+            reverse_samples = self.reverse(condition_input)
+            c_arr = np.array([c[v] for v in self.control_vars])
 
-        #     # Propose one or more control actions 
-        #     proposed_controls = []
-        #     for (xk, ck) in reverse_samples:
-        #         for _ in range(self.forwards_per_reverse):
-        #             # Proposed control action is a mixture of surrogate direction and random noise
-        #             # Balances exploration / exploitation
-        #             # TODO: Apply constraints here?
-        #             rand_direction = np.random.standard_normal(self.control_dim)
-        #             surr_direction = c_surr - ck
-        #             c_prop = ck + self.step_scale * ((1 - T) * surr_direction + rand_direction)
-        #             proposed_controls.append([xk, c_prop])
+            # Propose one or more control actions 
+            proposed_controls = []
+            for (i, xk) in enumerate(reverse_samples):
+                for _ in range(self.forwards_per_reverse):
+                    # Proposed control action is a mixture of surrogate direction and random noise
+                    # Balances exploration / exploitation
+                    rand_direction = np.random.standard_normal(self.control_dim)
+                    surr_direction = c_surr - c_arr
+                    c_prop = c_arr + self.step_scale * ((1 - T) * surr_direction + rand_direction)
+                    c_prop_dict = {k: v for (k, v) in zip(self.control_vars, c_prop)}
+                    proposed_controls.append([xk, c_prop_dict])
 
-        #     # Evaluate forward model for each state estimate / control action pair
-        #     # We do this asynchronously but immediately await the result
-        #     # The async part is thus not really necessary, but I am leaving it in in case we 
-        #     # might want to interleave additional work in the future.
-        #     future = self.executor.submit(self.forward, proposed_controls)
-        #     forward_samples = future.result()
+            # Evaluate forward model for each state estimate / control action pair
+            # We do this asynchronously but immediately await the result
+            # The async part is thus not really necessary, but I am leaving it in in case we 
+            # might want to interleave additional work in the future.
+            future = self.executor.submit(self.forward, proposed_controls)
+            forward_samples = future.result()
 
-        #     # Eval metrics and weight control proposals based on metrics
-        #     # This could be in the previous loop if serial, but
-        #     # that loop should be made parallel so I'm keeping it separate
-        #     numerator = np.zeros(self.control_dim)
-        #     denominator = 0.0
-        #     for forward_sample, control_prop in zip(forward_samples, proposed_controls):
-        #         if forward_sample is None:
-        #             # This occurs for simulation failures and other invalid states
-        #             continue
-        #         (_, ck) = control_prop
-        #         (xk_new, yk) = forward_sample
-        #         zk = self.metric(yk)
-        #         forward_sample.append(zk)
+            # Eval metrics and weight control proposals based on metrics
+            # This could be in the previous loop if serial, but
+            # that loop should be made parallel so I'm keeping it separate
+            numerator = np.zeros(self.control_dim)
+            denominator = 0.0
+            for forward_sample, control_prop in zip(forward_samples, proposed_controls):
+                if forward_sample is None:
+                    # This occurs for simulation failures and other invalid states
+                    continue
+                (_, ck) = control_prop
+                ck_arr = np.array([ck[k] for k in self.control_vars])
 
-        #         numerator += control_prop / zk**2
-        #         denominator += 1.0 / zk**2
+                (xk_new, fourier) = forward_sample
+                yk = self.forward.calc_data(xk_new, fourier)
+                
+                # Use version of metric with constraint.
+                _z, zk = self.metric(ck_arr, yk)
+                print(_z, zk)
+                numerator += ck_arr / zk**2
+                denominator += 1.0 / zk**2
 
-        #     # Get final model-proposed control point
-        #     c_model = numerator / denominator
-        # else:
-        #     c_model = np.zeros(self.control_dim)
-        #     proposed_controls = []
+            # Get final model-proposed control point
+            c_model = numerator / denominator
+        else:
+            c_model = np.zeros(self.control_dim)
+            proposed_controls = []
 
-        # # Once we have the model and surrogate-proposed controls in hand,
-        # # we can determine the final control action by interpolating between
-        # # the two based on model trust
-        # if self.surrogate is None:
-        #     c_final = c_model
-        # elif self.forward is None or self.reverse is None:
-        #     c_final = c_surr
-        # else:
-        #     c_final = (1 - T) * c_surr + T * c_model
+        print(f"{c_model=}")
 
-        # # Predict surrogate output at this point
-        # self.z_pred_surr = self.surrogate(c_final) if self.surrogate else float("inf")
+        # Once we have the model and surrogate-proposed controls in hand,
+        # we can determine the final control action by interpolating between
+        # the two based on model trust
+        if self.surrogate is None:
+            c_final = c_model
+        elif self.forward is None or self.reverse is None:
+            c_final = c_surr
+        else:
+            c_final = (1 - T) * c_surr + T * c_model
 
-        # # Predict mean model output asynchronously (so we can simultaneously command the thruster)
+        # Ensure c_final does not violate constraints
+        c_final = np.maximum(self.control_lb, np.minimum(self.control_ub, c_final))
+
+        # Predict surrogate output at this point
+        self.z_pred_surr = self.surrogate(c_final) if self.surrogate else float("inf")
+
+        # Predict mean model output asynchronously (so we can simultaneously command the thruster)
         # final_controls = [(xk, c_final) for xk, _ in reverse_samples]
         # self.z_pred_model_future = self.executor.submit(self.forward, final_controls)
 
         self.iter += 1
 
-        # # Return final proposed control action
-        # self.control_point = c_final
+        # Return final proposed control action
+        for k, v in zip(self.control_vars, c_final):
+            self.control_point[k] = v

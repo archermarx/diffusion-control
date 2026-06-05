@@ -47,11 +47,9 @@ class SimulationController(ThrusterController):
         self.setpoint = None
     
     def control_to(self, c):
-        control_keys = list(c.keys())
-        self.setpoint = list(c.values())
+        self.setpoint = c
         self.model = ForwardModel(
             self.thruster_config,
-            controls = control_keys,
             dataset_dir = self.dataset_dir,
             verbose=True,
             num_workers=1,
@@ -80,16 +78,9 @@ class SimulationController(ThrusterController):
             observer.stop()
         observer.join()
 
-        _, data_fourier = future.result()[0]
-
-        times = np.linspace(0, 1e-3, 1000)
-        data_timedomain = invert_fft_vector(times, data_fourier)
-
-        data_dict = {
-            "discharge_current_fourier": data_fourier.tolist(),
-            "discharge_current_time": times.tolist(),
-            "discharge_current_signal": data_timedomain.tolist(),
-        }
+        x, data_fourier = future.result()[0]
+        data_dict = self.model.calc_data(x, data_fourier)
+        data_dict["cathode_coupling_voltage_v"] = 0.0
 
         return data_dict
 

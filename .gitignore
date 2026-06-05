@@ -18,3 +18,5 @@ reverse_samples
 output.json
 *.json
 *.npz
+reverse/
+h9_ref/

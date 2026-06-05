@@ -16,7 +16,8 @@ def rms_amplitude(x):
     return np.sqrt(np.mean(x_centered**2))
 
 def metric(y):
-    return rms_amplitude(y["discharge_current_signal"])
+    return rms_amplitude(y["discharge_current"]["signal"])
+
 #
 config = "thrusters/h9.json"
 dataset_dir = "inputs"
@@ -24,15 +25,19 @@ dataset_dir = "inputs"
 # Forward model
 forward = ForwardModel(
     case_config=config,
-    controls=[
-        "magnetic_field_scale",
-        "anode_mass_flow_rate_kg_s",
-        "discharge_voltage_v",
-    ],
-    dataset_dir="inputs",
-    num_workers=16,
-    verbose=True,
+    dataset_dir="h9_ref",
+    num_workers=8,
+    verbose=False,
     duration=2e-3,
+)
+
+# Reverse model
+reverse = ReverseModel(
+    config_file="reverse_model/sample_h9.toml",
+    model="reverse_model/h9/checkpoint.pth.tar",
+    sample_dir="reverse_model/samples",
+    num_steps = 32,
+    num_samples = 8,
 )
 
 # Controller
@@ -79,19 +84,20 @@ controller = DiffusionController(
     controller=thruster,
     forward=forward,
     metric=metric,
+    reverse=reverse,
     surrogate=None,
-    reverse=None,
-    num_reverse_samples=16,
     forwards_per_reverse=1,
     trust_relaxation=0.5,
     control_lb = [B_min],
     control_ub = [B_max],
-    penalty_strength=0.05,
+    penalty_strength=5e-2,
 )
 
-controller.step()
+for i in range(10):
+    print(f"iteration {i}")
+    controller.step()
 
-cs = np.array(controller.cs)[0, :]
+cs = np.array(controller.cs)[:, 0]
 
 fig, ax = plt.subplots()
 ax.set(xlabel="Magnetic field scale", ylabel="Metric")

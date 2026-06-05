@@ -33,7 +33,6 @@ def setkey_deep(d, keystr, val, new_ok=False):
 class ForwardModel:
     def __init__(self,
             case_config: str | Path,
-            controls: list[str],
             dataset_dir: str | Path,
             duration: float = 1e-3,
             num_cells: int = 128,
@@ -52,7 +51,6 @@ class ForwardModel:
         }
 
         self.num_workers = num_workers  # How many parallel workers/threads to employ for running simulations
-        self.controls = controls        # vector of control actions
         self.duration = duration        # How long (in s) to run the forward model
         self.num_cells = num_cells      # The number of computational cells to be used in forward simulations
         self.verbose = verbose          # Whether HT.jl will print info about simulation success/failure
@@ -123,15 +121,32 @@ class ForwardModel:
             "simulation": simulation,
             "postprocess": {},
         }
+
+    def calc_data(self, tensor, fourier):
+        times = np.linspace(0, self.duration/2, 1001)
+        data_timedomain = invert_fft_vector(times, fourier)
+
+        data_dict = {
+            "discharge_current": {
+                "fourier": fourier.tolist(),
+                "time": times.tolist(),
+                "signal": data_timedomain.tolist(),
+            },
+        }
+
+        return data_dict
     
     def _make_config(self, state, control, output_file=None):
         """Generate a valid HallThruster.jl config dictionary corresponding to the given state and control"""
         cfg = self._base_config()
 
         if state is not None:
+            if len(state.shape) == 2:
+                state = state[None, ...]
+
             # Get anomalous collision frequency from tensor
-            nu_anom = self.dataset.get_field(state, "nu_an", action="denormalize")
-            B = self.dataset.get_field(state, "B", action="denormalize")
+            nu_anom = self.dataset.get_field(state, "nu_an")
+            B = self.dataset.get_field(state, "B")
             wce = 1.6e-19 * B / 9.1e-31
             c_anom = nu_anom / wce
             c_anom = c_anom.squeeze(0).tolist()
@@ -139,11 +154,11 @@ class ForwardModel:
 
             # Extract 6 scalar params from tensor
             for (oldkey, newkey) in self.keymap.items():
-                val = self.dataset.get_field(state, oldkey, action="denormalize")
+                val = self.dataset.get_field(state, oldkey)
                 setkey_deep(cfg, newkey, val.mean().item())
 
         # Extract controls
-        for keystr, control_val in zip(self.controls, control):
+        for keystr, control_val in control.items():
             setkey_deep(cfg, self.keymap[keystr], control_val)
 
         # Set output file

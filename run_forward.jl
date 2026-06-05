@@ -1,4 +1,4 @@
-@show Threads.nthreads()
+#@show Threads.nthreads()
 
 # TODO: either bundle normalize_data in this repo or expose this as an arg
 # TODO TODO: split julia code from main hall_diffusion repo and make separate package that we can just add
@@ -62,13 +62,14 @@ Threads.@threads for i in eachindex(input_files)
 
     if !isnothing(sim_dict)
         output = load_single_sim(sim_dict)
-        out_dict = Dict(
-            "params" => Float32.(output.params[2]),
-            "data" => Float32.(output.fields[2])',
-            "fourier" => Float32.(output.fourier[2]),
-            "perf" => Float32.(output.performance[2]),
-        )
-
-        NPZ.npzwrite(out_file, out_dict)
+        if !isnothing(output)
+            out_dict = Dict(
+                "params" => Float32.(output.params[2]),
+                "data" => Float32.(output.fields[2])',
+                "fourier" => Float32.(output.fourier[2]),
+                "perf" => Float32.(output.performance[2]),
+            )
+            NPZ.npzwrite(out_file, out_dict)
+        end
     end
 end
