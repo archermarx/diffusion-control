@@ -1,3 +1,4 @@
+import copy
 import numpy as np
 
 from surrogate import Surrogate
@@ -31,7 +32,7 @@ def log_penalty(x, lb, ub, penalty_strength = 5e-2):
     x = np.maximum(lb*(1+eps), np.minimum(ub*(1-eps), x))
     penalty_per_dim = -np.log(x-lb) - np.log(ub-x) - midpoint_f
     total_penalty = penalty_strength * np.mean(penalty_per_dim)
-    print(f"{x[0]=}, {total_penalty=}")
+    # print(f"{x[0]=}, {total_penalty=}")
     return total_penalty
 
 class DiffusionController:
@@ -108,11 +109,29 @@ class DiffusionController:
         self.model_trust = _validate_in_range(model_trust, "Model trust", 0, 1)
         self.trust_relaxation = _validate_in_range(trust_relaxation, "Trust relaxation", 0, 1)
 
-    # def __del__(self):
-    #     # Destructor shuts down the ThreadPoolExecutor
-    #     self.executor.shutdown(wait=True)
+    def dict_to_vec(self, control_dict: dict):
+        """
+        Convert a control setpoint from a dictionary to a vector.
+        This vector only contains the active control point.
+        """
+        v = np.array([control_dict[k] for k in self.control_vars])
+        return v
+
+    def vec_to_dict(self, control_vec: list | np.ndarray):
+        """
+        Convert a control setpoint from a vector representation to a dictionary.
+        Only the active control variable is represented in the vector, so the inactive
+        variables are filled in from the current control setpoint.
+        """
+        d = copy.deepcopy(self.control_point)
+        for (k, v) in zip(self.control_vars, control_vec):
+            d[k] = v
+        return d
 
     def update_model_trust(self, z):
+        """
+        Update the model trust parameter based on the previous iteration's model and surrogate predictions.
+        """
         if self.z_pred_model is None or self.z_pred_surr is None:
             # If we're in the first loop, we don't have previous predictions,
             # so we can't update the trust parameter
@@ -136,13 +155,20 @@ class DiffusionController:
 
     def step(self):
         # Control thruster to the given control point
+        # self.control_point is always a dictionary containing the full specification of the current control setpoint
+        # (including but not limited to the active optimization variable)
         c = self.control_point
         self.controller.control_to(c)
         y = self.controller.take_data()
 
-        # Evaluate metric on data
-        control_vec = [c[k] for k in self.control_vars]
+        # Evaluate metric on data.
+        # The metric returns two values -- a raw metric and one that incorporates constraints.
+        # Here, we're interested in the former.
+        control_vec = self.dict_to_vec(c)
         z, _ = self.metric(control_vec, y)
+
+        # Save the current control point and experimental metric
+        # TODO: better logging so we can restart
         self.cs.append(control_vec)
         self.zs.append(z)
 
@@ -172,26 +198,24 @@ class DiffusionController:
             c_surr, _ = np.zeros(self.control_dim), float("inf")
 
         if self.reverse is not None and self.forward is not None:
-            # Get state and control estimates
+            # Merge data dictionary and control point dictionary to condition the diffusion model
             condition_input = c | y
             # TODO: Condition diffusion model on discharge current
             # TODO: 1. normalize fourier signal
             # TODO: 2. pass as conditioning vector
             # TODO: should we use the current point or the best point to initialize this?
             reverse_samples = self.reverse(condition_input)
-            c_arr = np.array([c[v] for v in self.control_vars])
 
             # Propose one or more control actions 
             proposed_controls = []
-            for (i, xk) in enumerate(reverse_samples):
+            for xk in reverse_samples:
                 for _ in range(self.forwards_per_reverse):
                     # Proposed control action is a mixture of surrogate direction and random noise
                     # Balances exploration / exploitation
                     rand_direction = np.random.standard_normal(self.control_dim)
-                    surr_direction = c_surr - c_arr
-                    c_prop = c_arr + self.step_scale * ((1 - T) * surr_direction + rand_direction)
-                    c_prop_dict = {k: v for (k, v) in zip(self.control_vars, c_prop)}
-                    proposed_controls.append([xk, c_prop_dict])
+                    surr_direction = c_surr - control_vec
+                    c_proposed = control_vec + self.step_scale * ((1 - T) * surr_direction + rand_direction)
+                    proposed_controls.append([xk, self.vec_to_dict(c_proposed)])
 
             # Evaluate forward model for each state estimate / control action pair
             # We do this asynchronously but immediately await the result
@@ -205,29 +229,25 @@ class DiffusionController:
             # that loop should be made parallel so I'm keeping it separate
             numerator = np.zeros(self.control_dim)
             denominator = 0.0
-            for forward_sample, control_prop in zip(forward_samples, proposed_controls):
+            for forward_sample, (xk, ck) in zip(forward_samples, proposed_controls):
                 if forward_sample is None:
                     # This occurs for simulation failures and other invalid states
                     continue
-                (_, ck) = control_prop
-                ck_arr = np.array([ck[k] for k in self.control_vars])
 
                 (xk_new, fourier) = forward_sample
                 yk = self.forward.calc_data(xk_new, fourier)
                 
                 # Use version of metric with constraint.
-                _z, zk = self.metric(ck_arr, yk)
-                print(_z, zk)
-                numerator += ck_arr / zk**2
-                denominator += 1.0 / zk**2
+                ck_vec = self.dict_to_vec(ck)
+                z_bases, z_with_constraints = self.metric(ck_vec, yk)
+                numerator += ck_vec / z_with_constraints**2
+                denominator += 1.0 / z_with_constraints**2
 
             # Get final model-proposed control point
             c_model = numerator / denominator
         else:
             c_model = np.zeros(self.control_dim)
             proposed_controls = []
-
-        print(f"{c_model=}")
 
         # Once we have the model and surrogate-proposed controls in hand,
         # we can determine the final control action by interpolating between
@@ -252,5 +272,5 @@ class DiffusionController:
         self.iter += 1
 
         # Return final proposed control action
-        for k, v in zip(self.control_vars, c_final):
-            self.control_point[k] = v
+        self.control_point = self.vec_to_dict(c_final)
+        return self.control_point

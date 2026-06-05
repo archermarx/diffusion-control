@@ -36,8 +36,8 @@ reverse = ReverseModel(
     config_file="reverse_model/sample_h9.toml",
     model="reverse_model/h9/checkpoint.pth.tar",
     sample_dir="reverse_model/samples",
-    num_steps = 32,
-    num_samples = 8,
+    num_steps = 512,
+    num_samples = 32,
 )
 
 # Controller
@@ -93,17 +93,19 @@ controller = DiffusionController(
     penalty_strength=5e-2,
 )
 
-for i in range(10):
+for i in range(5):
     print(f"iteration {i}")
     controller.step()
 
-cs = np.array(controller.cs)[:, 0]
+    cs = np.array(controller.cs)[:, 0]
+    alphas = np.linspace(0.25, 1.0, len(cs)) if len(cs) > 2 else [1.0]
 
-fig, ax = plt.subplots()
-ax.set(xlabel="Magnetic field scale", ylabel="Metric")
-ax.plot(B_vals, ampls, label="Ground truth")
-ax.axvline(B_min, color='black', linestyle='--')
-ax.axvline(B_max, color='black', linestyle='--')
-ax.plot(cs, controller.zs, '-o', color='red')
-ax.legend()
-fig.savefig("Id_bfield.png", dpi=200)
+    fig, ax = plt.subplots()
+    ax.set(xlabel="Magnetic field scale", ylabel="Metric")
+    ax.plot(B_vals, ampls, label="Ground truth")
+    ax.axvline(B_min, color='black', linestyle='--')
+    ax.axvline(B_max, color='black', linestyle='--')
+    ax.plot(cs, controller.zs, color='red', zorder=9)
+    ax.scatter(cs, controller.zs, color='red', alpha = alphas, zorder=10)
+    ax.legend()
+    fig.savefig("Id_bfield.png", dpi=200)
