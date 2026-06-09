@@ -89,6 +89,7 @@ class DiffusionController:
         if metric is None:
             raise ValueError("Metric must be specified! This should be a function of the data which returns a positive number.")
 
+        self.raw_metric = metric
         def metric_with_constraint(c, y):
             z = metric(y)
             z_prime = z + log_penalty(c, self.control_lb, self.control_ub, self.penalty_strength)
@@ -113,24 +114,28 @@ class DiffusionController:
     #     self.executor.shutdown(wait=True)
 
     def update_model_trust(self, z):
+        if self.surrogate is None:
+            self.model_trust = 1.0
+            return self.model_trust
+
+        if self.forward is None or self.reverse is None:
+            self.model_trust = 0.0
+            return self.model_trust
+
         if self.z_pred_model is None or self.z_pred_surr is None:
-            # If we're in the first loop, we don't have previous predictions,
-            # so we can't update the trust parameter
-            if self.surrogate is None:
-                # No surrogate specified, we have to trust the model
-                self.model_trust = 1.0
-            elif self.forward is None or self.reverse is None:
-                # No model, we have to trust the surrogate
-                self.model_trust = 0.0
-            else:
-                # Use inverse distance weighting to interpolate between surrogate and modeling
-                # The distance is evaluated as the difference between predicted and observed 
-                # z for a specified control action
-                beta = self.trust_relaxation
-                dz_surr = np.abs(z - self.z_pred_surr)
-                dz_model = np.abs(z - self.z_pred_model)
-                new_trust = (1.0/dz_model)**2 / (1.0/dz_model**2 + 1.0/dz_surr**2)
-                self.model_trust = beta * new_trust + (1 - beta) * self.model_trust
+            return self.model_trust
+
+        beta = self.trust_relaxation
+        eps = 1e-12
+
+        dz_surr = np.abs(z - self.z_pred_surr)
+        dz_model = np.abs(z - self.z_pred_model)
+
+        w_model = 1.0 / (dz_model + eps) ** 2
+        w_surr = 1.0 / (dz_surr + eps) ** 2
+
+        new_trust = w_model / (w_model + w_surr)
+        self.model_trust = beta * new_trust + (1 - beta) * self.model_trust
 
         return self.model_trust
 
@@ -147,23 +152,32 @@ class DiffusionController:
         self.zs.append(z)
 
         # Await results of forward model from before and average the metrics
+        #CHANGED THE FOLLOWING
         if self.z_pred_model_future is not None:
-            z_pred_model_results = self.z_pred_model_future.result()
-            self.z_pred_model = 0.0
-            count = 0
-            for result in z_pred_model_results:
+            results = self.z_pred_model_future.result()
+            predicted_metrics = []
+
+            for result in results:
                 if result is None:
                     continue
-                _, yk = result
-                self.z_pred_model += self.metric(yk)
-                count += 1
-            self.z_pred_model /= count
+
+                xk_new, fourier = result
+                yk = self.forward.calc_data(xk_new, fourier)
+                predicted_metrics.append(self.raw_metric(yk))
+
+            self.z_pred_model = (
+                float(np.mean(predicted_metrics))
+                if predicted_metrics
+                else None
+            )
+
+            self.z_pred_model_future = None
 
         T = self.update_model_trust(z)
 
         if self.surrogate is not None:
             # Update surrogate model with new data point
-            self.surrogate.update(c, z)
+            self.surrogate.update(control_vec, z)
 
             # Perform local optimization on surrogate
             # to find optimal control location
@@ -248,6 +262,22 @@ class DiffusionController:
         # Predict mean model output asynchronously (so we can simultaneously command the thruster)
         # final_controls = [(xk, c_final) for xk, _ in reverse_samples]
         # self.z_pred_model_future = self.executor.submit(self.forward, final_controls)
+
+        #CHANGED THE FOLLOWING
+        if self.forward is not None and self.reverse is not None:
+            c_final_dict = {
+                k: v for k, v in zip(self.control_vars, c_final)
+            }
+
+            final_controls = [
+                (xk, c_final_dict.copy())
+                for xk in reverse_samples
+            ]
+
+            self.z_pred_model_future = self.executor.submit(
+                self.forward,
+                final_controls,
+            )
 
         self.iter += 1
 
