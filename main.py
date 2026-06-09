@@ -10,6 +10,8 @@ from control_loop import DiffusionController
 
 from hall_diffusion.utils.thruster_data import invert_fft_vector
 
+from surrogate import Surrogate
+
 def rms_amplitude(x):
     mean = np.mean(x)
     x_centered = x - mean
@@ -21,6 +23,12 @@ def metric(y):
 #
 config = "thrusters/h9.json"
 dataset_dir = "inputs"
+
+CONTROL_VARS = [
+    "magnetic_field_scale",
+    "discharge_voltage_v",
+    "anode_mass_flow_rate_kg_s",
+]
 
 # Forward model
 forward = ForwardModel(
@@ -85,7 +93,13 @@ controller = DiffusionController(
     forward=forward,
     metric=metric,
     reverse=reverse,
-    surrogate=None,
+    surrogate=Surrogate( #update
+        dim=1,
+        bounds=[(B_min, B_max)],
+        min_points=2,
+        optimize_restarts=20,
+        seed=1,
+    ),
     forwards_per_reverse=1,
     trust_relaxation=0.5,
     control_lb = [B_min],

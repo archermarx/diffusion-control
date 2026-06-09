@@ -91,6 +91,7 @@ class DiffusionController:
         if metric is None:
             raise ValueError("Metric must be specified! This should be a function of the data which returns a positive number.")
 
+        self.raw_metric = metric
         def metric_with_constraint(c, y):
             z = metric(y)
             c_vec = self.dict_to_vec(c)
@@ -175,6 +176,64 @@ class DiffusionController:
         return y, z
 
     def update_model_trust(self, z):
+        if self.surrogate is None:
+            self.model_trust = 1.0
+            return self.model_trust
+
+        if self.forward is None or self.reverse is None:
+            self.model_trust = 0.0
+            return self.model_trust
+
+        if self.z_pred_model is None or self.z_pred_surr is None:
+            return self.model_trust
+
+        beta = self.trust_relaxation
+        eps = 1e-12
+
+        dz_surr = np.abs(z - self.z_pred_surr)
+        dz_model = np.abs(z - self.z_pred_model)
+
+        w_model = 1.0 / (dz_model + eps) ** 2
+        w_surr = 1.0 / (dz_surr + eps) ** 2
+
+        new_trust = w_model / (w_model + w_surr)
+        self.model_trust = beta * new_trust + (1 - beta) * self.model_trust
+
+        return self.model_trust
+
+    def step(self):
+        # Control thruster to the given control point
+        c = self.control_point
+        self.controller.control_to(c)
+        y = self.controller.take_data()
+
+        # Evaluate metric on data
+        control_vec = [c[k] for k in self.control_vars]
+        z, _ = self.metric(control_vec, y)
+        self.cs.append(control_vec)
+        self.zs.append(z)
+
+        # Await results of forward model from before and average the metrics
+        #CHANGED THE FOLLOWING
+        if self.z_pred_model_future is not None:
+            results = self.z_pred_model_future.result()
+            predicted_metrics = []
+
+            for result in results:
+                if result is None:
+                    continue
+
+                xk_new, fourier = result
+                yk = self.forward.calc_data(xk_new, fourier)
+                predicted_metrics.append(self.raw_metric(yk))
+
+            self.z_pred_model = (
+                float(np.mean(predicted_metrics))
+                if predicted_metrics
+                else None
+            )
+
+            self.z_pred_model_future = None
         """
         Update the model trust parameter based on the previous iteration's model and surrogate predictions.
         """
@@ -223,6 +282,8 @@ class DiffusionController:
     def get_surrogate_proposed_control(self, c: np.ndarray, z):
         if self.surrogate is not None:
             # Update surrogate model with new data point
+            self.surrogate.update(control_vec, z)
+
             self.surrogate.update(c, z)
             # Perform local optimization on surrogate
             # to find optimal control location
@@ -357,6 +418,22 @@ class DiffusionController:
         # Predict mean model output asynchronously (so we can simultaneously command the thruster)
         # final_controls = [(xk, c_final) for xk, _ in reverse_samples]
         # self.z_pred_model_future = self.executor.submit(self.forward, final_controls)
+
+        #CHANGED THE FOLLOWING
+        if self.forward is not None and self.reverse is not None:
+            c_final_dict = {
+                k: v for k, v in zip(self.control_vars, c_final)
+            }
+
+            final_controls = [
+                (xk, c_final_dict.copy())
+                for xk in reverse_samples
+            ]
+
+            self.z_pred_model_future = self.executor.submit(
+                self.forward,
+                final_controls,
+            )
 
         self.iter += 1
 
