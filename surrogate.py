@@ -1,6 +1,7 @@
 import numpy as np
 from scipy.optimize import minimize
 from smt.surrogate_models import KRG
+import matplotlib.pyplot as plt
 
 
 class Surrogate:
@@ -10,7 +11,7 @@ class Surrogate:
         bounds=None,
         min_points=None,
         theta0=None,
-        corr="squar_exp",
+        corr="matern32",
         optimize_restarts=10,
         seed=None,
     ):
@@ -27,6 +28,8 @@ class Surrogate:
 
         self.model = None
         self.is_trained = False
+
+        self.history = []
 
     def __call__(self, x) -> float:
         x = self._as_vector(x)
@@ -51,6 +54,7 @@ class Surrogate:
         # Not sure if we should fit every single time update is called or find a way to circumvent this
         # because fitting every time for increasing datapoints could become costly
         self._fit()
+        self._store_history()
 
     def optimize(self) -> tuple[np.ndarray, float]:
         if len(self.Y) == 0:
@@ -138,6 +142,9 @@ class Surrogate:
         return X_unique, Y_unique
 
     def _scale(self, X):
+        return self._scale_with_reference(X, self.X)
+
+    def _scale_with_reference(self, X, X_reference):
         X = np.asarray(X, dtype=float)
 
         if self.bounds is not None:
@@ -147,8 +154,9 @@ class Surrogate:
             width[width == 0.0] = 1.0
             return (X - lo) / width
 
-        center = np.mean(np.vstack(self.X), axis=0)
-        scale = np.std(np.vstack(self.X), axis=0)
+        X_reference = np.vstack(X_reference)
+        center = np.mean(X_reference, axis=0)
+        scale = np.std(X_reference, axis=0)
         scale[scale < 1e-12] = 1.0
         return (X - center) / scale
 
@@ -183,24 +191,939 @@ class Surrogate:
             raise ValueError(f"Expected dimension {self.dim}, got {x.size}")
 
         return x
+    
+    def plot_1d(
+        self,
+        ground_truth=None,
+        num_points=400,
+        errorbar_points=25,
+        confidence=2.0,
+        show_band=True,
+        xlabel="Control c",
+        ylabel="Metric z",
+        title="Kriging surrogate",
+        ground_truth_label="Ground truth",
+        filename=None,
+        extension=0,
+        show=True,
+    ):
+        """
+        Plot a one-dimensional Kriging surrogate and its uncertainty.
 
+        Parameters
+        ----------
+        ground_truth:
+            Either:
 
-if __name__ == "__main__":
-    # Smoke test: known minimum near c = 1.05
-    s = Surrogate(
-        dim=1,
-        bounds=[(0.75, 1.25)],
-        min_points=2,
-        optimize_restarts=20,
-        seed=1,
+            1. A callable:
+                ground_truth(c) -> z
+
+            2. A tuple containing existing data arrays:
+                (ground_truth_controls, ground_truth_metrics)
+
+            3. None, in which case no ground-truth curve is shown.
+
+        num_points:
+            Number of points used to draw the surrogate curve.
+
+        errorbar_points:
+            Number of locations where uncertainty error bars are drawn.
+
+        confidence:
+            Number of predictive standard deviations used for the uncertainty.
+            confidence=2 approximately corresponds to mean ± 2 standard deviations.
+
+        show_band:
+            Whether to also show a continuous uncertainty band.
+
+        filename:
+            Optional path where the figure is saved.
+
+        show:
+            Whether to display the plot interactively.
+        """
+
+        if self.dim != 1:
+            raise ValueError(
+                "plot_1d() only works for a one-dimensional surrogate. "
+                "For a multidimensional surrogate, plot a one-dimensional slice."
+            )
+
+        if not self.is_trained:
+            raise RuntimeError(
+                "The surrogate must be trained before it can be plotted."
+            )
+
+        # Real control points and measured metric values used to train KRG
+        observed_c = np.vstack(self.X)[:, 0]
+        observed_z = np.asarray(self.Y, dtype=float)
+
+        # Decide what control range should be plotted
+        if self.bounds is not None:
+            lower, upper = self.bounds[0]
+        else:
+            lower = float(np.min(observed_c))
+            upper = float(np.max(observed_c))
+
+            span = upper - lower
+            padding = 0.2 * span if span > 0 else 0.1
+
+            lower -= padding
+            upper += padding
+
+        # Dense grid used to draw the surrogate function
+        c_grid = np.linspace(lower - extension, upper + extension, num_points)
+        c_grid_matrix = c_grid.reshape(-1, 1)
+        c_grid_scaled = self._scale(c_grid_matrix)
+
+        # Kriging predicted mean and variance
+        predicted_mean = (
+            self.model.predict_values(c_grid_scaled)
+            .reshape(-1)
+        )
+
+        predicted_variance = (
+            self.model.predict_variances(c_grid_scaled)
+            .reshape(-1)
+        )
+
+        # Small negative variances can occur from numerical roundoff
+        predicted_variance = np.maximum(predicted_variance, 0.0)
+
+        # Error bars must use standard deviation, not raw variance
+        predicted_std = np.sqrt(predicted_variance)
+        uncertainty = confidence * predicted_std
+
+        confidence_lower = predicted_mean - uncertainty
+        confidence_upper = predicted_mean + uncertainty
+
+        # Use only a smaller number of points for error bars so the plot
+        # does not become overcrowded
+        error_indices = np.linspace(
+            0,
+            num_points - 1,
+            min(errorbar_points, num_points),
+            dtype=int,
+        )
+
+        c_error = c_grid[error_indices]
+        mean_error = predicted_mean[error_indices]
+        y_error = uncertainty[error_indices]
+
+        # Surrogate-predicted minimum
+        c_best, z_best = self.optimize()
+
+        fig, ax = plt.subplots(figsize=(9, 6))
+
+        # Plot the Kriging mean function
+        ax.plot(
+            c_grid,
+            predicted_mean,
+            label="Kriging predicted mean",
+            linewidth=2,
+        )
+
+        # Plot uncertainty as vertical error bars along the surrogate curve
+        # ax.errorbar(
+        #     c_error,
+        #     mean_error,
+        #     yerr=y_error,
+        #     fmt="none",
+        #     capsize=3,
+        #     alpha=0.65,
+        #     label=(
+        #         f"Kriging uncertainty "
+        #         f"(±{confidence:g} standard deviations)"
+        #     ),
+        # )
+
+        # Optional continuous uncertainty band
+        if show_band:
+            ax.fill_between(
+                c_grid,
+                confidence_lower,
+                confidence_upper,
+                alpha=0.15,
+                label=(
+                    f"Mean ± {confidence:g} standard deviations"
+                ),
+            )
+
+        # Plot the actual control/metric observations used for training
+        ax.scatter(
+            observed_c,
+            observed_z,
+            marker="o",
+            s=55,
+            label="Observed control points",
+            zorder=4,
+        )
+
+        # Plot the ground-truth function if one was provided
+        if ground_truth is not None:
+            if callable(ground_truth):
+                ground_truth_c = c_grid
+                ground_truth_z = np.asarray(
+                    [ground_truth(c) for c in ground_truth_c],
+                    dtype=float,
+                )
+            else:
+                if len(ground_truth) != 2:
+                    raise ValueError(
+                        "ground_truth must be either a callable or "
+                        "a tuple of (control_values, metric_values)."
+                    )
+
+                ground_truth_c = np.asarray(
+                    ground_truth[0],
+                    dtype=float,
+                ).reshape(-1)
+
+                ground_truth_z = np.asarray(
+                    ground_truth[1],
+                    dtype=float,
+                ).reshape(-1)
+
+                if ground_truth_c.size != ground_truth_z.size:
+                    raise ValueError(
+                        "Ground-truth control and metric arrays "
+                        "must have the same length."
+                    )
+
+            ax.plot(
+                ground_truth_c,
+                ground_truth_z,
+                linestyle="--",
+                linewidth=2,
+                label=ground_truth_label,
+            )
+
+        # Show the minimum found by optimize()
+        ax.scatter(
+            c_best[0],
+            z_best,
+            marker="*",
+            s=180,
+            label="Surrogate-predicted minimum",
+            zorder=5,
+        )
+
+        ax.set_xlabel(xlabel)
+        ax.set_ylabel(ylabel)
+        ax.set_title(title)
+        ax.grid(True, alpha=0.3)
+        ax.legend()
+
+        fig.tight_layout()
+
+        if filename is not None:
+            fig.savefig(
+                filename,
+                dpi=200,
+                bbox_inches="tight",
+            )
+
+        if show:
+            plt.show()
+
+        return fig, ax
+
+    def plot_convergence_1d(
+        self,
+        ground_truth=None,
+        num_points=400,
+        errorbar_points=25,
+        confidence=2.0,
+        show_band=False,
+        xlabel="Control c",
+        ylabel="Metric z",
+        title="Kriging surrogate convergence",
+        ground_truth_label="Ground truth",
+        filename=None,
+        show=True,
+        extension=0,
+        label_every=1,
+    ):
+        """
+        Plot the surrogate after every update on the same figure to show convergence.
+
+        For each stored snapshot:
+            - rebuild the surrogate model at that stage
+            - plot the surrogate mean curve
+
+        Also plots:
+            - final observed control points
+            - final uncertainty as error bars
+            - optional ground-truth function
+            - final surrogate-predicted minimum
+        """
+
+        if self.dim != 1:
+            raise ValueError(
+                "plot_convergence_1d() only works for a one-dimensional surrogate."
+            )
+
+        if len(self.history) == 0:
+            raise RuntimeError("No history has been recorded yet.")
+
+        final_X = np.vstack(self.X)[:, 0]
+        final_Y = np.asarray(self.Y, dtype=float)
+
+        if self.bounds is not None:
+            lower, upper = self.bounds[0]
+        else:
+            lower = float(np.min(final_X))
+            upper = float(np.max(final_X))
+            span = upper - lower
+            padding = 0.2 * span if span > 0 else 0.1
+            lower -= padding
+            upper += padding
+
+        c_grid = np.linspace(lower - extension, upper + extension, num_points)
+        c_grid_matrix = c_grid.reshape(-1, 1)
+
+        fig, ax = plt.subplots(figsize=(9, 6))
+
+        # Plot the ground-truth curve if given
+        if ground_truth is not None:
+            if callable(ground_truth):
+                gt_x = c_grid
+                gt_y = np.asarray([ground_truth(c) for c in gt_x], dtype=float)
+            else:
+                if len(ground_truth) != 2:
+                    raise ValueError(
+                        "ground_truth must be a callable or a tuple "
+                        "(x_values, y_values)."
+                    )
+                gt_x = np.asarray(ground_truth[0], dtype=float).reshape(-1)
+                gt_y = np.asarray(ground_truth[1], dtype=float).reshape(-1)
+
+            ax.plot(
+                gt_x,
+                gt_y,
+                linestyle="--",
+                linewidth=2,
+                label=ground_truth_label,
+            )
+
+        # Plot the surrogate curve from each snapshot
+        n_hist = len(self.history)
+
+        for i, snapshot in enumerate(self.history, start=1):
+            X_snapshot = snapshot["X"]
+            Y_snapshot = snapshot["Y"]
+
+            alpha = 0.15 + 0.75 * (i / n_hist)
+            linewidth = 1.0 if i < n_hist else 2.5
+
+            # If not enough unique points yet to train KRG,
+            # show a flat "best so far" line
+            model = self._fit_snapshot_model(X_snapshot, Y_snapshot)
+
+            if model is None:
+                y_flat = np.full_like(c_grid, float(np.min(Y_snapshot)))
+                label = (
+                    f"after {len(Y_snapshot)} points"
+                    if (i % label_every == 0 or i == n_hist)
+                    else None
+                )
+                ax.plot(
+                    c_grid,
+                    y_flat,
+                    linewidth=linewidth,
+                    alpha=alpha,
+                    label=label,
+                )
+                continue
+
+            c_grid_scaled = self._scale_with_reference(c_grid_matrix, X_snapshot)
+            predicted_mean = model.predict_values(c_grid_scaled).reshape(-1)
+
+            label = (
+                f"after {len(Y_snapshot)} points"
+                if (i % label_every == 0 or i == n_hist)
+                else None
+            )
+
+            ax.plot(
+                c_grid,
+                predicted_mean,
+                linewidth=linewidth,
+                alpha=alpha,
+                label=label,
+            )
+
+        # Plot final uncertainty from the final trained model
+        if self.is_trained:
+            c_grid_scaled = self._scale(c_grid_matrix)
+            predicted_mean = self.model.predict_values(c_grid_scaled).reshape(-1)
+            predicted_variance = self.model.predict_variances(c_grid_scaled).reshape(-1)
+            predicted_variance = np.maximum(predicted_variance, 0.0)
+            predicted_std = np.sqrt(predicted_variance)
+            yerr = confidence * predicted_std
+
+            # sparse error bars so the plot doesn't get too messy
+            error_indices = np.linspace(
+                0,
+                num_points - 1,
+                min(errorbar_points, num_points),
+                dtype=int,
+            )
+
+            ax.errorbar(
+                c_grid[error_indices],
+                predicted_mean[error_indices],
+                yerr=yerr[error_indices],
+                fmt="none",
+                capsize=3,
+                alpha=0.6,
+                label=f"Final uncertainty (±{confidence:g} std)",
+            )
+
+            if show_band:
+                ax.fill_between(
+                    c_grid,
+                    predicted_mean - yerr,
+                    predicted_mean + yerr,
+                    alpha=0.12,
+                    label=f"Final mean ± {confidence:g} std",
+                )
+
+        # Plot the final observed points
+        ax.scatter(
+            final_X,
+            final_Y,
+            marker="o",
+            s=55,
+            label="Observed points",
+            zorder=5,
+        )
+
+        # Plot the final predicted minimum
+        if self.is_trained:
+            c_best, z_best = self.optimize()
+            ax.scatter(
+                c_best[0],
+                z_best,
+                marker="*",
+                s=180,
+                label="Final predicted minimum",
+                zorder=6,
+            )
+
+        ax.set_xlabel(xlabel)
+        ax.set_ylabel(ylabel)
+        ax.set_title(title)
+        ax.grid(True, alpha=0.3)
+        ax.legend()
+
+        fig.tight_layout()
+
+        if filename is not None:
+            fig.savefig(filename, dpi=200, bbox_inches="tight")
+
+        if show:
+            plt.show()
+
+        return fig, ax
+
+    def plot_1d_on_axis(
+        self,
+        ax,
+        ground_truth=None,
+        num_points=400,
+        errorbar_points=15,
+        confidence=2.0,
+        show_band=True,
+        xlabel="Control c",
+        ylabel="Metric z",
+        title=None,
+        ground_truth_label="Ground truth",
+        extension=0.0,
+    ):
+        """
+        Draw the current one-dimensional surrogate on an existing axis.
+
+        This is useful for placing several surrogate-update plots next
+        to each other in one figure.
+        """
+
+        if self.dim != 1:
+            raise ValueError(
+                "plot_1d_on_axis() only works for a one-dimensional surrogate."
+            )
+
+        if not self.is_trained:
+            raise RuntimeError(
+                "The surrogate must be trained before it can be plotted."
+            )
+
+        observed_c = np.vstack(self.X)[:, 0]
+        observed_z = np.asarray(self.Y, dtype=float)
+
+        if self.bounds is not None:
+            lower = min(self.bounds[0][0], float(np.min(observed_c)))
+            upper = max(self.bounds[0][1], float(np.max(observed_c)))
+        else:
+            lower = float(np.min(observed_c))
+            upper = float(np.max(observed_c))
+
+        c_grid = np.linspace(
+            lower - extension,
+            upper + extension,
+            num_points,
+        )
+
+        c_grid_scaled = self._scale(c_grid.reshape(-1, 1))
+
+        predicted_mean = self.model.predict_values(
+            c_grid_scaled
+        ).reshape(-1)
+
+        predicted_variance = self.model.predict_variances(
+            c_grid_scaled
+        ).reshape(-1)
+
+        predicted_variance = np.maximum(
+            predicted_variance,
+            0.0,
+        )
+
+        predicted_std = np.sqrt(predicted_variance)
+        uncertainty = confidence * predicted_std
+
+        ax.plot(
+            c_grid,
+            predicted_mean,
+            linewidth=2,
+            label="Kriging mean",
+        )
+
+        if show_band:
+            ax.fill_between(
+                c_grid,
+                predicted_mean - uncertainty,
+                predicted_mean + uncertainty,
+                alpha=0.15,
+                label=f"Mean ± {confidence:g} std",
+            )
+
+        error_indices = np.linspace(
+            0,
+            num_points - 1,
+            min(errorbar_points, num_points),
+            dtype=int,
+        )
+
+        # ax.errorbar(
+        #     c_grid[error_indices],
+        #     predicted_mean[error_indices],
+        #     yerr=uncertainty[error_indices],
+        #     fmt="none",
+        #     capsize=2,
+        #     alpha=0.5,
+        #     label="Prediction uncertainty",
+        # )
+
+        ax.scatter(
+            observed_c,
+            observed_z,
+            s=40,
+            marker="o",
+            label="Observed points",
+            zorder=4,
+        )
+
+        if ground_truth is not None:
+            if callable(ground_truth):
+                ground_truth_c = c_grid
+                ground_truth_z = np.asarray(
+                    [ground_truth(c) for c in ground_truth_c],
+                    dtype=float,
+                )
+            else:
+                ground_truth_c = np.asarray(
+                    ground_truth[0],
+                    dtype=float,
+                ).reshape(-1)
+
+                ground_truth_z = np.asarray(
+                    ground_truth[1],
+                    dtype=float,
+                ).reshape(-1)
+
+            ax.plot(
+                ground_truth_c,
+                ground_truth_z,
+                linestyle="--",
+                linewidth=2,
+                label=ground_truth_label,
+            )
+
+        # Use the plotted grid to mark the approximate minimum.
+        # This avoids running the full multistart optimizer for every subplot.
+        best_index = int(np.argmin(predicted_mean))
+
+        ax.scatter(
+            c_grid[best_index],
+            predicted_mean[best_index],
+            marker="*",
+            s=130,
+            label="Predicted minimum",
+            zorder=5,
+        )
+
+        ax.set_xlim(c_grid[0], c_grid[-1])
+        ax.set_xlabel(xlabel)
+        ax.set_ylabel(ylabel)
+
+        if title is not None:
+            ax.set_title(title)
+
+        ax.grid(True, alpha=0.3)
+
+    def _store_history(self):
+        snapshot = {
+            "X": [x.copy() for x in self.X],
+            "Y": list(self.Y),
+            "is_trained": self.is_trained,
+        }
+        self.history.append(snapshot)
+
+    def _fit_snapshot_model(self, X_snapshot, Y_snapshot):
+        X = np.vstack(X_snapshot)
+        Y = np.array(Y_snapshot, dtype=float)
+
+        X_scaled = self._scale_with_reference(X, X_snapshot)
+        X_unique, Y_unique = self._remove_duplicate_points(X_scaled, Y)
+
+        if len(Y_unique) < self.min_points:
+            return None
+
+        model = KRG(
+            theta0=self.theta0,
+            corr=self.corr,
+            print_global=False,
+        )
+
+        model.set_training_values(X_unique, Y_unique.reshape(-1, 1))
+        model.train()
+
+        return model
+
+def run_progression_test(
+        name,
+        ground_truth,
+        bounds,
+        control_points,
+        filename,
+        min_points=3,
+        extension=0.0,
+        columns=3,
+    ):
+        """
+        Train a surrogate one control point at a time and place every
+        trained stage into one subplot figure.
+        """
+
+        surrogate = Surrogate(
+            dim=1,
+            bounds=[bounds],
+            min_points=min_points,
+            optimize_restarts=5,
+            seed=1,
+        )
+
+        number_of_plots = len(control_points) - min_points + 1
+
+        if number_of_plots <= 0:
+            raise ValueError(
+                "There must be at least min_points control points."
+            )
+
+        columns = min(columns, number_of_plots)
+        rows = int(np.ceil(number_of_plots / columns))
+
+        fig, axes = plt.subplots(
+            rows,
+            columns,
+            figsize=(5 * columns, 4 * rows),
+            squeeze=False,
+        )
+
+        axes = axes.reshape(-1)
+        plot_index = 0
+
+        for count, control in enumerate(control_points, start=1):
+            metric = ground_truth(control)
+            surrogate.update([control], metric)
+
+            if not surrogate.is_trained:
+                continue
+
+            surrogate.plot_1d_on_axis(
+                ax=axes[plot_index],
+                ground_truth=ground_truth,
+                xlabel="Control c",
+                ylabel="Function value z",
+                title=f"{count} points",
+                extension=extension,
+            )
+
+            plot_index += 1
+
+        # Hide any unused subplot spaces.
+        for axis in axes[plot_index:]:
+            axis.axis("off")
+
+        # Create one shared legend instead of repeating a legend in every subplot.
+        handles, labels = axes[plot_index - 1].get_legend_handles_labels()
+
+        fig.legend(
+            handles,
+            labels,
+            loc="lower center",
+            ncol=3,
+        )
+
+        fig.suptitle(
+            f"{name}: Kriging surrogate convergence",
+            fontsize=16,
+        )
+
+        fig.tight_layout(
+            rect=(0.0, 0.09, 1.0, 0.95)
+        )
+
+        fig.savefig(
+            filename,
+            dpi=200,
+            bbox_inches="tight",
+        )
+
+        plt.close(fig)
+
+        c_best, z_best = surrogate.optimize()
+
+        print(f"\n{name}")
+        print("Final predicted best c:", c_best)
+        print("Final predicted z:", z_best)
+        print("Variance at predicted minimum:", surrogate.variance(c_best))
+        print("Saved:", filename)
+  
+def generate_control_points(bounds, num_points, seed=1, shuffle=True):
+    """
+    Generate evenly spaced control points across the supplied bounds.
+
+    shuffle=True changes the order in which points are added so the
+    surrogate receives points from different parts of the domain instead
+    of receiving them strictly from left to right.
+    """
+    lower, upper = bounds
+
+    points = np.linspace(
+        lower,
+        upper,
+        num_points,
     )
 
-    for c in [0.75, 0.9, 1.0, 1.15, 1.25]:
-        z = (c - 1.05) ** 2
-        s.update([c], z)
+    if shuffle:
+        rng = np.random.default_rng(seed)
+        points = rng.permutation(points)
 
-    c_best, z_best = s.optimize()
+    return points.tolist()
 
-    print("best c:", c_best)
-    print("predicted z:", z_best)
-    print("variance:", s.variance(c_best))
+# if __name__ == "__main__":
+#     try:
+#         # Smoke test: known minimum near c = 1.05
+#         s = Surrogate(
+#             dim=1,
+#             bounds=[(-2, 2)],
+#             min_points=2,
+#             optimize_restarts=5,
+#             seed=1,
+#         )
+
+#         def ground_truth(c):
+#             return (((c - 1.05) ** 2) * ((c + 1.05) ** 2))
+
+#         control_points = [-1.1, -1.0, -0.7, -0.65, -0.4, -0.2, 0, 0.35, 0.4, 0.65, 0.7, 0.75, 0.9, 1.0, 1.1, 1.15, 1.2, 1.25]
+
+#         ext = 0
+
+#         for count, c in enumerate(control_points, start=1):
+#             z = ground_truth(c)
+#             s.update([c], z)
+
+#             # KRG cannot be plotted until enough distinct points exist.
+#             if not s.is_trained:
+#                 print(
+#                     f"Added point {count}: c={c}, z={z}. "
+#                     "Not enough points to train KRG yet."
+#                 )
+#                 continue
+
+#             fig, ax = s.plot_1d(
+#                 ground_truth=ground_truth,
+#                 xlabel="Control c",
+#                 ylabel="Metric z",
+#                 title=f"Kriging surrogate with {count} points added",
+#                 filename=f"surrogate_{count}_points.png",
+#                 show=False,
+#                 extension=ext
+#             )
+
+#             # Prevent saved figures from accumulating in memory.
+#             plt.close(fig)
+
+#             print(f"Saved surrogate_{count}_points.png")
+
+#         # Optimize only once after all points have been added.
+#         c_best, z_best = s.optimize()
+
+#         print("best c:", c_best)
+#         print("predicted z:", z_best)
+#         print("variance:", s.variance(c_best))
+
+#         fig, ax = s.plot_convergence_1d(
+#             ground_truth=ground_truth,
+#             xlabel="Control c",
+#             ylabel="Metric z",
+#             title="Kriging surrogate convergence",
+#             filename="surrogate_convergence.png",
+#             show_band=True,
+#             label_every=1,
+#             show=False,
+#             extension=ext
+#         )
+
+#         plt.close(fig)
+
+#         print("Saved surrogate_convergence.png")
+
+#     except KeyboardInterrupt:
+#         plt.close("all")
+#         print("\nStopped by user.")
+
+if __name__ == "__main__":
+    try:
+        # -------------------------------------------------
+        # Optimization test functions
+        # -------------------------------------------------
+
+        def quartic(c):
+            """
+            Double-well quartic.
+            Global minima near c = -1.05 and c = 1.05.
+            """
+            return ((c - 1.05) ** 2) * ((c + 1.05) ** 2)
+
+
+        def ackley(c):
+            """
+            One-dimensional Ackley function.
+            Global minimum: c = 0, z = 0.
+            """
+            a = 20.0
+            b = 0.2
+            frequency = 2.0 * np.pi
+
+            return (
+                -a * np.exp(-b * np.sqrt(c**2))
+                - np.exp(np.cos(frequency * c))
+                + a
+                + np.e
+            )
+
+
+        def rastrigin(c):
+            """
+            One-dimensional Rastrigin function.
+            Global minimum: c = 0, z = 0.
+            Contains many local minima.
+            """
+            return c**2 - 10.0 * np.cos(2.0 * np.pi * c) + 10.0
+
+
+        def forrester(c):
+            """
+            Common one-dimensional surrogate-model benchmark.
+            Defined on approximately [0, 1].
+            """
+            return ((6.0 * c - 2.0) ** 2) * np.sin(12.0 * c - 4.0)
+
+
+        # -------------------------------------------------
+        # Test-case definitions
+        # -------------------------------------------------
+
+        test_cases = [
+            {
+                "name": "Quartic double well",
+                "function": quartic,
+                "bounds": (-1.5, 1.5),
+                "control_points": generate_control_points(
+                    bounds=(-1.5, 1.5),
+                    num_points=15,
+                    seed=1,
+                ),
+                "filename": "quartic_progression.png",
+                "extension": 0.1,
+            },
+            {
+                "name": "Ackley function",
+                "function": ackley,
+                "bounds": (-5.0, 5.0),
+                "control_points": generate_control_points(
+                    bounds=(-5.0, 5.0),
+                    num_points=50,
+                    seed=2,
+                ),
+                "filename": "ackley_progression.png",
+                "extension": 0.25,
+            },
+            {
+                "name": "Rastrigin function",
+                "function": rastrigin,
+                "bounds": (-5.12, 5.12),
+                "control_points": generate_control_points(
+                    bounds=(-5.12, 5.12),
+                    num_points=50,
+                    seed=3,
+                ),
+                "filename": "rastrigin_progression.png",
+                "extension": 0.2,
+            },
+            {
+                "name": "Forrester function",
+                "function": forrester,
+                "bounds": (0.0, 1.0),
+                "control_points": generate_control_points(
+                    bounds=(0.0, 1.0),
+                    num_points=50,
+                    seed=4,
+                ),
+                "filename": "forrester_progression.png",
+                "extension": 0.03,
+            },
+        ]
+
+        # -------------------------------------------------
+        # Run all benchmark tests
+        # -------------------------------------------------
+
+        for test in test_cases:
+            run_progression_test(
+                name=test["name"],
+                ground_truth=test["function"],
+                bounds=test["bounds"],
+                control_points=test["control_points"],
+                filename=test["filename"],
+                min_points=3,
+                extension=test["extension"],
+                columns=3,
+            )
+
+    except KeyboardInterrupt:
+        plt.close("all")
+        print("\nStopped by user.")
