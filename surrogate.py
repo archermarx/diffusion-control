@@ -2,6 +2,7 @@ import numpy as np
 from scipy.optimize import minimize
 from smt.surrogate_models import KRG
 import matplotlib.pyplot as plt
+from scipy.stats import norm
 
 
 class Surrogate:
@@ -13,6 +14,8 @@ class Surrogate:
         theta0=None,
         corr="matern32",
         optimize_restarts=10,
+        acquisition="ei",
+        xi=0.0,
         seed=None,
     ):
         self.dim = dim
@@ -21,6 +24,16 @@ class Surrogate:
         self.theta0 = theta0 if theta0 is not None else [1e-2] * dim
         self.corr = corr
         self.optimize_restarts = optimize_restarts
+
+        if acquisition not in {"mean", "ei"}:
+            raise ValueError("acquisition must be 'mean' or 'ei'")
+
+        if xi < 0.0:
+            raise ValueError("xi must be nonnegative")
+
+        self.acquisition = acquisition
+        self.xi = float(xi)
+
         self.rng = np.random.default_rng(seed)
 
         self.X = []
@@ -56,7 +69,34 @@ class Surrogate:
         self._fit()
         self._store_history()
 
-    def optimize(self) -> tuple[np.ndarray, float]:
+    def optimize(
+        self,
+        acquisition=None,
+    ) -> tuple[np.ndarray, float]:
+        """
+        Find a control using either:
+
+            acquisition="mean":
+                lowest predicted Kriging mean
+
+            acquisition="ei":
+                largest Expected Improvement
+
+        Returns
+        -------
+        c_best:
+            Selected control point.
+
+        z_pred:
+            Kriging predicted metric at that control point.
+            This is not the EI value.
+        """
+
+        mode = self.acquisition if acquisition is None else acquisition
+
+        if mode not in {"mean", "ei"}:
+            raise ValueError("acquisition must be 'mean' or 'ei'")
+
         if len(self.Y) == 0:
             c0 = self._default_control()
             return c0, self(c0)
@@ -64,35 +104,92 @@ class Surrogate:
         best_seen_idx = int(np.argmin(self.Y))
         best_seen = self.X[best_seen_idx].copy()
 
+        # EI is not meaningful until KRG has been trained.
+        if not self.is_trained:
+            return best_seen, float(self.Y[best_seen_idx])
+
         bounds = self._get_bounds(best_seen)
 
-        starts = [best_seen, self.X[-1].copy()]
+        midpoint = np.array(
+            [
+                0.5 * (lo + hi)
+                for lo, hi in bounds
+            ],
+            dtype=float,
+        )
 
-        for idx in np.argsort(self.Y)[: min(3, len(self.Y))]:
-            starts.append(self.X[int(idx)].copy())
+        starts = [midpoint]
 
+        if mode == "mean":
+            # For mean minimization, known good controls are useful starts.
+            starts.append(best_seen)
+            starts.append(self.X[-1].copy())
+
+            for idx in np.argsort(self.Y)[: min(3, len(self.Y))]:
+                starts.append(
+                    self.X[int(idx)].copy()
+                )
+
+        elif mode == "ei":
+            # Do not rely primarily on observed points for EI.
+            # At observed points, Kriging variance and EI are usually near zero.
+            for idx in np.argsort(self.Y)[: min(3, len(self.Y))]:
+                center = self.X[int(idx)].copy()
+
+                jitter = np.array(
+                    [
+                        0.05 * (hi - lo)
+                        * self.rng.standard_normal()
+                        for lo, hi in bounds
+                    ]
+                )
+
+                starts.append(
+                    self._clip(center + jitter)
+                )
+
+        # Add random multistart locations for either acquisition.
         for _ in range(self.optimize_restarts):
-            starts.append(np.array([self.rng.uniform(lo, hi) for lo, hi in bounds]))
+            starts.append(
+                np.array(
+                    [
+                        self.rng.uniform(lo, hi)
+                        for lo, hi in bounds
+                    ]
+                )
+            )
 
-        best_c = best_seen.copy()
-        best_z = self(best_c)
+        objective = lambda c: self._acquisition_objective(
+            c,
+            mode,
+        )
+
+        best_c = self._clip(starts[0])
+        best_objective = objective(best_c)
 
         for start in starts:
             result = minimize(
-                lambda c: self(c),
+                objective,
                 start,
                 method="L-BFGS-B",
                 bounds=bounds,
             )
 
             c_candidate = self._clip(result.x)
-            z_candidate = self(c_candidate)
+            candidate_objective = objective(c_candidate)
 
-            if z_candidate < best_z:
+            if (
+                np.isfinite(candidate_objective)
+                and candidate_objective < best_objective
+            ):
                 best_c = c_candidate
-                best_z = z_candidate
+                best_objective = candidate_objective
 
-        return best_c, float(best_z)
+        # Preserve the existing interface:
+        # return the chosen control and its predicted metric.
+        z_pred = self(best_c)
+
+        return best_c, float(z_pred)
 
     def variance(self, x) -> float:
         x = self._as_vector(x)
@@ -103,6 +200,81 @@ class Surrogate:
         x_scaled = self._scale(x.reshape(1, -1))
         var = self.model.predict_variances(x_scaled)
         return max(0.0, float(var[0, 0]))
+
+    def mean_and_std(self, x) -> tuple[float, float]:
+        """
+        Return the Kriging predicted mean and standard deviation at x.
+        """
+
+        x = self._as_vector(x)
+
+        if not self.is_trained:
+            raise RuntimeError(
+                "The surrogate must be trained before predicting uncertainty."
+            )
+
+        x_scaled = self._scale(x.reshape(1, -1))
+
+        mean = float(
+            self.model.predict_values(x_scaled)[0, 0]
+        )
+
+        variance = float(
+            self.model.predict_variances(x_scaled)[0, 0]
+        )
+
+        variance = max(variance, 0.0)
+        std = np.sqrt(variance)
+
+        return mean, float(std)
+
+    def expected_improvement(self, x) -> float:
+        """
+        Expected Improvement acquisition value for minimization.
+
+        A larger value means x is a more useful control point to evaluate next.
+        """
+
+        if not self.is_trained:
+            return 0.0
+
+        mean, std = self.mean_and_std(x)
+
+        best_observed = float(np.min(self.Y))
+
+        improvement = (
+            best_observed
+            - mean
+            - self.xi
+        )
+
+        # Handle points with effectively zero uncertainty.
+        if std < 1e-12:
+            return max(improvement, 0.0)
+
+        gamma = improvement / std
+
+        ei = (
+            improvement * norm.cdf(gamma)
+            + std * norm.pdf(gamma)
+        )
+
+        return max(0.0, float(ei))
+
+    def _acquisition_objective(self, c, acquisition):
+        """
+        Objective passed to scipy.optimize.minimize().
+
+        SciPy minimizes, so EI is negated because EI should be maximized.
+        """
+
+        if acquisition == "mean":
+            return self(c)
+
+        if acquisition == "ei":
+            return -self.expected_improvement(c)
+
+        raise ValueError("acquisition must be 'mean' or 'ei'")
 
     def _fit(self):
         X = np.vstack(self.X)
@@ -311,7 +483,9 @@ class Surrogate:
         y_error = uncertainty[error_indices]
 
         # Surrogate-predicted minimum
-        c_best, z_best = self.optimize()
+        c_best, z_best = self.optimize(
+            acquisition="mean"
+        )
 
         fig, ax = plt.subplots(figsize=(9, 6))
 
@@ -321,6 +495,20 @@ class Surrogate:
             predicted_mean,
             label="Kriging predicted mean",
             linewidth=2,
+        )
+
+
+        c_ei, z_ei = self.optimize(
+            acquisition="ei"
+        )
+
+        ax.scatter(
+            c_ei[0],
+            z_ei,
+            marker="D",
+            s=90,
+            label="EI-selected next point",
+            zorder=6,
         )
 
         # Plot uncertainty as vertical error bars along the surrogate curve
@@ -601,13 +789,28 @@ class Surrogate:
 
         # Plot the final predicted minimum
         if self.is_trained:
-            c_best, z_best = self.optimize()
+            c_best, z_best = self.optimize(
+                acquisition="mean"
+            )
             ax.scatter(
                 c_best[0],
                 z_best,
                 marker="*",
                 s=180,
                 label="Final predicted minimum",
+                zorder=6,
+            )
+
+            c_ei, z_ei = self.optimize(
+                acquisition="ei"
+            )
+
+            ax.scatter(
+                c_ei[0],
+                z_ei,
+                marker="D",
+                s=90,
+                label="EI-selected next point",
                 zorder=6,
             )
 
@@ -640,6 +843,7 @@ class Surrogate:
         title=None,
         ground_truth_label="Ground truth",
         extension=0.0,
+        ei_point=None,
     ):
         """
         Draw the current one-dimensional surrogate on an existing axis.
@@ -773,6 +977,19 @@ class Surrogate:
             zorder=5,
         )
 
+        if ei_point is not None:
+            ei_point = self._as_vector(ei_point)
+            ei_predicted_z = self(ei_point)
+
+            ax.scatter(
+                ei_point[0],
+                ei_predicted_z,
+                marker="D",
+                s=90,
+                label="EI-selected next point",
+                zorder=6,
+            )
+
         ax.set_xlim(c_grid[0], c_grid[-1])
         ax.set_xlabel(xlabel)
         ax.set_ylabel(ylabel)
@@ -830,7 +1047,9 @@ def run_progression_test(
             dim=1,
             bounds=[bounds],
             min_points=min_points,
-            optimize_restarts=5,
+            optimize_restarts=20,
+            acquisition="mean",
+            xi=0.0,
             seed=1,
         )
 
@@ -911,6 +1130,176 @@ def run_progression_test(
         print("Variance at predicted minimum:", surrogate.variance(c_best))
         print("Saved:", filename)
   
+def run_ei_progression_test(
+    name,
+    ground_truth,
+    bounds,
+    initial_points,
+    ei_iterations,
+    filename,
+    min_points=3,
+    extension=0.0,
+    columns=3,
+    optimize_restarts=20,
+    xi=0.0,
+    seed=1,
+):
+    """
+    Start with a small initial design and let Expected Improvement choose
+    each subsequent control point.
+
+    Each stage is plotted as a subplot in one output image.
+    """
+
+    if len(initial_points) < min_points:
+        raise ValueError(
+            "The number of initial points must be at least min_points."
+        )
+
+    surrogate = Surrogate(
+        dim=1,
+        bounds=[bounds],
+        min_points=min_points,
+        optimize_restarts=optimize_restarts,
+        acquisition="ei",
+        xi=xi,
+        seed=seed,
+    )
+
+    # Add the initial observations.
+    for control in initial_points:
+        surrogate.update(
+            [control],
+            ground_truth(control),
+        )
+
+    # One initial plot, then one plot after every EI-selected update.
+    number_of_plots = ei_iterations + 1
+
+    columns = min(columns, number_of_plots)
+    rows = int(np.ceil(number_of_plots / columns))
+
+    fig, axes = plt.subplots(
+        rows,
+        columns,
+        figsize=(5 * columns, 4 * rows),
+        squeeze=False,
+    )
+
+    axes = axes.reshape(-1)
+
+    selected_controls = []
+    selected_actual_values = []
+    selected_ei_values = []
+
+    for stage in range(number_of_plots):
+        # Select the next point before plotting so the plotted diamond
+        # is exactly the point that will be evaluated next.
+        c_next = None
+        ei_value = None
+
+        if stage < ei_iterations:
+            c_next, _ = surrogate.optimize(
+                acquisition="ei"
+            )
+
+            ei_value = surrogate.expected_improvement(
+                c_next
+            )
+
+        surrogate.plot_1d_on_axis(
+            ax=axes[stage],
+            ground_truth=ground_truth,
+            xlabel="Control c",
+            ylabel="Function value z",
+            title=f"{len(surrogate.Y)} points",
+            extension=extension,
+            ei_point=c_next,
+        )
+
+        # Add the EI value to the subplot.
+        if c_next is not None:
+            axes[stage].text(
+                0.03,
+                0.97,
+                (
+                    f"Next c = {c_next[0]:.4f}\n"
+                    f"EI = {ei_value:.3e}"
+                ),
+                transform=axes[stage].transAxes,
+                verticalalignment="top",
+                bbox={
+                    "boxstyle": "round",
+                    "alpha": 0.75,
+                },
+            )
+
+            # Evaluate the real benchmark function and update KRG.
+            z_actual = ground_truth(c_next[0])
+
+            selected_controls.append(
+                float(c_next[0])
+            )
+            selected_actual_values.append(
+                float(z_actual)
+            )
+            selected_ei_values.append(
+                float(ei_value)
+            )
+
+            surrogate.update(
+                c_next,
+                z_actual,
+            )
+
+    # Hide unused subplot spaces.
+    for axis in axes[number_of_plots:]:
+        axis.axis("off")
+
+    # Create one shared legend.
+    handles, labels = axes[0].get_legend_handles_labels()
+
+    fig.legend(
+        handles,
+        labels,
+        loc="lower center",
+        ncol=3,
+    )
+
+    fig.suptitle(
+        f"{name}: Expected Improvement progression",
+        fontsize=16,
+    )
+
+    fig.tight_layout(
+        rect=(0.0, 0.09, 1.0, 0.95)
+    )
+
+    fig.savefig(
+        filename,
+        dpi=200,
+        bbox_inches="tight",
+    )
+
+    plt.close(fig)
+
+    # Final estimated minimum of the Kriging mean.
+    c_best, z_best = surrogate.optimize(
+        acquisition="mean"
+    )
+
+    print(f"\n{name} — Expected Improvement")
+    print("Final predicted minimum c:", c_best)
+    print("Final predicted metric:", z_best)
+    print("Saved:", filename)
+
+    return {
+        "surrogate": surrogate,
+        "selected_controls": np.array(selected_controls),
+        "selected_actual_values": np.array(selected_actual_values),
+        "selected_ei_values": np.array(selected_ei_values),
+    }
+
 def generate_control_points(bounds, num_points, seed=1, shuffle=True):
     """
     Generate evenly spaced control points across the supplied bounds.
@@ -1019,18 +1408,29 @@ if __name__ == "__main__":
             return ((c - 1.05) ** 2) * ((c + 1.05) ** 2)
 
 
+        # def ackley(c):
+        #     """
+        #     One-dimensional Ackley function.
+        #     Global minimum: c = 0, z = 0.
+        #     """
+        #     a = 20.0
+        #     b = 0.2
+        #     frequency = 2.0 * np.pi
+
+        #     return (
+        #         -a * np.exp(-b * np.sqrt(c**2))
+        #         - np.exp(np.cos(frequency * c))
+        #         + a
+        #         + np.e
+        #     )
+
         def ackley(c):
-            """
-            One-dimensional Ackley function.
-            Global minimum: c = 0, z = 0.
-            """
             a = 20.0
             b = 0.2
-            frequency = 2.0 * np.pi
 
             return (
-                -a * np.exp(-b * np.sqrt(c**2))
-                - np.exp(np.cos(frequency * c))
+                -a * np.exp(-b * np.abs(c))
+                - np.exp(np.cos(2.0 * np.pi * c))
                 + a
                 + np.e
             )
@@ -1108,6 +1508,69 @@ if __name__ == "__main__":
             },
         ]
 
+        ei_test_cases = [
+            {
+                "name": "Quartic double well",
+                "function": quartic,
+                "bounds": (-1.5, 1.5),
+                "initial_points": [
+                    -1.5,
+                    -0.5,
+                    0.5,
+                    1.5,
+                ],
+                "ei_iterations": 12,
+                "filename": "quartic_ei_progression.png",
+                "extension": 0.1,
+                "seed": 1,
+            },
+            {
+                "name": "Ackley function",
+                "function": ackley,
+                "bounds": (-5.0, 5.0),
+                "initial_points": [
+                    -5.0,
+                    -2.0,
+                    2.0,
+                    5.0,
+                ],
+                "ei_iterations": 25,
+                "filename": "ackley_ei_progression.png",
+                "extension": 0.25,
+                "seed": 2,
+            },
+            {
+                "name": "Rastrigin function",
+                "function": rastrigin,
+                "bounds": (-5.12, 5.12),
+                "initial_points": [
+                    -5.12,
+                    -2.0,
+                    2.0,
+                    5.12,
+                ],
+                "ei_iterations": 25,
+                "filename": "rastrigin_ei_progression.png",
+                "extension": 0.2,
+                "seed": 3,
+            },
+            {
+                "name": "Forrester function",
+                "function": forrester,
+                "bounds": (0.0, 1.0),
+                "initial_points": [
+                    0.0,
+                    0.3,
+                    0.7,
+                    1.0,
+                ],
+                "ei_iterations": 16,
+                "filename": "forrester_ei_progression.png",
+                "extension": 0.03,
+                "seed": 4,
+            },
+        ]
+
         # -------------------------------------------------
         # Run all benchmark tests
         # -------------------------------------------------
@@ -1122,6 +1585,22 @@ if __name__ == "__main__":
                 min_points=3,
                 extension=test["extension"],
                 columns=3,
+            )
+
+        for test in ei_test_cases:
+            run_ei_progression_test(
+                name=test["name"],
+                ground_truth=test["function"],
+                bounds=test["bounds"],
+                initial_points=test["initial_points"],
+                ei_iterations=test["ei_iterations"],
+                filename=test["filename"],
+                min_points=4,
+                extension=test["extension"],
+                columns=4,
+                optimize_restarts=25,
+                xi=0.0,
+                seed=test["seed"],
             )
 
     except KeyboardInterrupt:
