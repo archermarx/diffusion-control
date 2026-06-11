@@ -45,9 +45,9 @@ def run_progression_test(
         for i in range(frame + 1):
             control = control_points[i]
             metric = ground_truth(control)
-            frame_surrogate.update([control], metric)
+            frame_surrogate.update([control], metric, run_async=False)
 
-        if frame_surrogate.is_trained:
+        if frame_surrogate.is_trained: # Safe to plot now!
             plot_1d_on_axis(
                 frame_surrogate,
                 ax=ax,
@@ -106,7 +106,7 @@ def run_ei_progression_test(
     )
 
     for control in initial_points:
-        surrogate.update([control], ground_truth(control))
+        surrogate.update([control], ground_truth(control), run_async=False)
 
     recorded_points = list(initial_points)
     recorded_c_next = []
@@ -120,7 +120,7 @@ def run_ei_progression_test(
         recorded_ei_values.append(ei_value)
 
         z_actual = ground_truth(c_next[0])
-        surrogate.update(c_next, z_actual)
+        surrogate.update(c_next, z_actual, run_async=False)
         recorded_points.append(float(c_next[0]))
 
     # Dummy values for the final visual frame where no next point is predicted
@@ -144,31 +144,36 @@ def run_ei_progression_test(
 
         points_to_add = recorded_points[:len(initial_points) + frame]
         for pt in points_to_add:
-            frame_surrogate.update([pt], ground_truth(pt))
+            frame_surrogate.update([pt], ground_truth(pt), run_async=False)
 
         c_next = recorded_c_next[frame]
         ei_value = recorded_ei_values[frame]
 
-        plot_1d_on_axis(
-            frame_surrogate,
-            ax=ax,
-            ax_ei=ax_ei,
-            ground_truth=ground_truth,
-            xlabel="Control c",
-            ylabel="Function value z",
-            title=f"{name} (EI): Stage {frame} ({len(frame_surrogate.Y)} points)",
-            extension=extension,
-            ei_point=c_next,
-        )
-
-        if c_next is not None:
-            ax.text(
-                0.03, 0.97,
-                f"Next c = {c_next[0]:.4f}\nEI = {ei_value:.3e}",
-                transform=ax.transAxes,
-                verticalalignment="top",
-                bbox={"boxstyle": "round", "alpha": 0.75, "facecolor": "white"},
+        if frame_surrogate.is_trained: # Safe to plot now!
+            plot_1d_on_axis(
+                frame_surrogate,
+                ax=ax,
+                ax_ei=ax_ei,
+                ground_truth=ground_truth,
+                xlabel="Control c",
+                ylabel="Function value z",
+                title=f"{name} (EI): Stage {frame} ({len(frame_surrogate.Y)} points)",
+                extension=extension,
+                ei_point=c_next,
             )
+
+            if c_next is not None and ei_value is not None:
+                ax.text(
+                    0.03, 0.97,
+                    f"Next c = {c_next[0]:.4f}\nEI = {ei_value:.3e}",
+                    transform=ax.transAxes,
+                    verticalalignment="top",
+                    bbox={"boxstyle": "round", "alpha": 0.75, "facecolor": "white"},
+                )
+        else:
+            # Fallback if the surrogate hasn't hit min_points yet
+            ax.set_title(f"Initializing {name} (EI)...")
+            ax.set_xlim(bounds[0], bounds[1])
 
     anim = animation.FuncAnimation(
         fig, 
