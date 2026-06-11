@@ -11,7 +11,6 @@ from scipy.stats import norm
 from smt.surrogate_models import KRG
 from smt.applications.ego import EGO
 from smt.design_space.design_space import DesignSpace, FloatVariable
-from smt.problems import Rosenbrock, Branin
 
 class Surrogate:
     def __init__(
@@ -35,7 +34,7 @@ class Surrogate:
         self.optimize_restarts = optimize_restarts
 
         self.design_space = DesignSpace(
-            design_variables=[FloatVariable(bounds[0][0], bounds[0][1])], #FloatVariable(self.y_lims[0], self.y_lims[1])], 
+            design_variables=[FloatVariable(bounds[i][0], bounds[i][1]) for i in range(len(bounds))],
             seed=seed)
 
         if acquisition not in {"mean", "ei"}:
@@ -324,23 +323,23 @@ class Surrogate:
 
         return max(0.0, float(ei))
     
-    def negative_EI(x_test):
-        # We need the current best physical metric to calculate Expected Improvement
-        f_min = np.min(self.Y)
+    # def negative_EI(x_test):
+    #     # We need the current best physical metric to calculate Expected Improvement
+    #     f_min = np.min(self.Y)
 
-        """Calculates the negative EI because Scipy only minimizes."""
-        x_test_reshaped = np.array(x_test).reshape(1, -1)
-        pred = self.model.predict_values(x_test_reshaped)
-        var = self.model.predict_variances(x_test_reshaped)
+    #     """Calculates the negative EI because Scipy only minimizes."""
+    #     x_test_reshaped = np.array(x_test).reshape(1, -1)
+    #     pred = self.model.predict_values(x_test_reshaped)
+    #     var = self.model.predict_variances(x_test_reshaped)
         
-        var[var == 0.0] = 1e-12  # Prevent divide-by-zero at known sample points
+    #     var[var == 0.0] = 1e-12  # Prevent divide-by-zero at known sample points
         
-        args0 = (f_min - pred) / np.sqrt(var)
-        args1 = (f_min - pred) * norm.cdf(args0)
-        args2 = np.sqrt(var) * norm.pdf(args0)
+    #     args0 = (f_min - pred) / np.sqrt(var)
+    #     args1 = (f_min - pred) * norm.cdf(args0)
+    #     args2 = np.sqrt(var) * norm.pdf(args0)
         
-        ei = args1 + args2
-        return -ei[0, 0]  # Return negative EI
+    #     ei = args1 + args2
+    #     return -ei[0, 0]  # Return negative EI
 
     def _acquisition_objective(self, c, acquisition):
         """

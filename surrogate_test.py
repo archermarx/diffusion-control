@@ -227,6 +227,19 @@ if __name__ == "__main__":
                 "control_points": generate_control_points((-1.5, 1.5), 15, seed=1),
                 "extension": 0.1,
             },
+
+            {
+                "name": "Ackley function",
+                "function": ackley,
+                "bounds": (-5.0, 5.0),
+                "control_points": generate_control_points((-5.0, 5.0), 15, seed=2),
+                "extension": 0.5,
+            },
+
+            {
+                "name": "Rosenbrock function",
+
+            }
         ]
 
         ei_test_cases = [
